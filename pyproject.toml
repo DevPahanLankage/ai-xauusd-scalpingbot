@@ -4,13 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xauusd-scalping-foundation"
-version = "0.1.0"
-description = "Read-only XAUUSD market snapshot collector over the MT5 Terminal MCP"
+version = "0.2.0"
+description = "Read-only XAUUSD market collector with news-aware AI advisory mode"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "httpx2>=2.10,<3",
     "mcp>=2.3.0,<3",
+    "openai>=3.24,<4",
+    "pydantic>=2.13,<3",
     "python-dotenv>=1.1,<2",
 ]
 

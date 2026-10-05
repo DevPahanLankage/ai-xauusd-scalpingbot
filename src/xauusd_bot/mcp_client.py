@@ -23,6 +23,8 @@ READ_ONLY_TOOL_ALLOWLIST = frozenset(
         "get_time_information",
         "get_chart_history",
         "get_chart_ticks_history",
+        "economic_calendar_list_events_by_currency",
+        "economic_calendar_list_values",
     }
 )
 

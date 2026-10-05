@@ -51,6 +51,22 @@ class MCPReadOnlySafetyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result, {"ok": True})
         self.assertEqual(self.protocol.calls, sorted(READ_ONLY_TOOL_ALLOWLIST))
 
+    def test_allowlist_is_exactly_the_reviewed_read_only_surface(self) -> None:
+        self.assertEqual(
+            READ_ONLY_TOOL_ALLOWLIST,
+            {
+                "get_workspace_info",
+                "get_marketwatch_symbols",
+                "get_trading_account_info",
+                "get_trading_open_positions",
+                "get_time_information",
+                "get_chart_history",
+                "get_chart_ticks_history",
+                "economic_calendar_list_events_by_currency",
+                "economic_calendar_list_values",
+            },
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 
+from .advisory_service import AIAdvisoryOutcome
+from .economic_calendar import EconomicNewsGateResult
 from .models import MarketGateResult, XAUUSDMarketSnapshot
 
 
@@ -124,4 +126,69 @@ def to_human(snapshot: XAUUSDMarketSnapshot, gate: MarketGateResult) -> str:
         lines.extend(f"  - {reason}" for reason in gate.rejection_reasons)
     else:
         lines.append("Rejection reasons   : none")
+    return "\n".join(lines)
+
+
+def advisory_to_json(
+    snapshot: XAUUSDMarketSnapshot,
+    market_gate: MarketGateResult,
+    news_gate: EconomicNewsGateResult,
+    outcome: AIAdvisoryOutcome,
+) -> str:
+    return json.dumps(
+        {
+            "snapshot": snapshot.to_dict(),
+            "market_gate": market_gate.to_dict(),
+            "news_gate": news_gate.to_dict(),
+            "ai_advisory": {
+                "attempted": outcome.attempted,
+                "skip_reason": outcome.skip_reason,
+                "input_hash": outcome.input_hash,
+                "result": outcome.result.to_dict() if outcome.result else None,
+            },
+        },
+        indent=2,
+        ensure_ascii=False,
+    )
+
+
+def advisory_to_human(
+    snapshot: XAUUSDMarketSnapshot,
+    market_gate: MarketGateResult,
+    news_gate: EconomicNewsGateResult,
+    outcome: AIAdvisoryOutcome,
+) -> str:
+    lines = [to_human(snapshot, market_gate), "", "Economic News Gate (USD, fail-closed)", "=" * 40]
+    lines.extend(
+        [
+            f"Calendar available  : {str(news_gate.calendar_available).lower()}",
+            f"Safe for AI         : {str(news_gate.safe_for_ai).lower()}",
+            f"Blackout active     : {str(news_gate.blackout_active).lower()}",
+            (
+                "Nearest high impact : none in configured window"
+                if news_gate.nearest_event is None
+                else f"{news_gate.nearest_event.name} "
+                f"({news_gate.minutes_to_nearest_event:+.1f} minutes)"
+            ),
+        ]
+    )
+    if news_gate.rejection_reasons:
+        lines.append("News rejection      : " + ", ".join(news_gate.rejection_reasons))
+    lines.extend(["", "OpenAI Advisory (no execution)", "=" * 31])
+    if not outcome.attempted or outcome.result is None:
+        lines.append(f"AI request          : skipped ({outcome.skip_reason})")
+    else:
+        decision = outcome.result.decision
+        lines.extend(
+            [
+                "AI request          : attempted",
+                f"Status              : {outcome.result.status}",
+                f"Decision            : {decision.decision.value}",
+                f"Confidence          : {decision.confidence}",
+                f"Setup               : {decision.setup_summary}",
+                f"Entry / SL / TP     : {decision.entry_price} / {decision.stop_loss} / {decision.take_profit}",
+                f"Risk/reward         : {decision.risk_reward_ratio}",
+                f"Estimated cost USD  : {outcome.result.estimated_cost_usd}",
+            ]
+        )
     return "\n".join(lines)

@@ -1,4 +1,4 @@
-"""Read-only XAUUSD market snapshot collector."""
+"""Read-only XAUUSD collector with advisory-only AI analysis."""
 
 from .candidate_tracker import CandidateEvaluationTracker, CandidateReservation
 from .models import MarketGateResult, XAUUSDMarketSnapshot
@@ -9,4 +9,4 @@ __all__ = [
     "MarketGateResult",
     "XAUUSDMarketSnapshot",
 ]
-__version__ = "0.1.0"
+__version__ = "0.2.0"

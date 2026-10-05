@@ -9,3 +9,7 @@ __pycache__/
 build/
 dist/
 .codex/config.toml
+.state/
+*.sqlite
+*.sqlite3
+*.db
