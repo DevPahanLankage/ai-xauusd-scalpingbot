@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "xauusd-scalping-foundation"
+version = "0.1.0"
+description = "Read-only XAUUSD market snapshot collector over the MT5 Terminal MCP"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=2.3.0,<3",
+    "python-dotenv>=1.1,<2",
+]
+
+[project.scripts]
+xauusd-snapshot = "xauusd_bot.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
