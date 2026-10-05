@@ -128,6 +128,8 @@ class MarketGateMetrics:
     m5_spike_ratio: float | None
     m1_candle_count: int
     m5_candle_count: int
+    m1_completed_candle_count: int
+    m5_completed_candle_count: int
     recent_tick_count: int
     free_margin: float
 
@@ -147,7 +149,6 @@ class MarketGateResult:
     direction_m5: Direction
     directions_aligned: bool
     existing_position: bool
-    duplicate_completed_m1: bool
     completed_m1_time: str | None
     rejection_reasons: tuple[str, ...]
     metrics: MarketGateMetrics

@@ -117,7 +117,6 @@ def to_human(snapshot: XAUUSDMarketSnapshot, gate: MarketGateResult) -> str:
             f"Directions aligned  : {str(gate.directions_aligned).lower()}",
             f"Existing position   : {str(gate.existing_position).lower()}",
             f"Completed M1        : {gate.completed_m1_time or 'unavailable'}",
-            f"Duplicate M1        : {str(gate.duplicate_completed_m1).lower()}",
         ]
     )
     if gate.rejection_reasons:

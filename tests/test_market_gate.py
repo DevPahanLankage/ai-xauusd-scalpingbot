@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import unittest
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from xauusd_bot.analysis import calculate_metrics
+from xauusd_bot.candidate_tracker import CandidateEvaluationTracker
 from xauusd_bot.config import MarketGateConfig
 from xauusd_bot.market_gate import MarketGate
 from xauusd_bot.models import (
@@ -143,6 +144,26 @@ def _position() -> PositionSnapshot:
     )
 
 
+def _timestamp_style(snapshot: XAUUSDMarketSnapshot, style: str) -> XAUUSDMarketSnapshot:
+    def convert(value: str) -> str:
+        parsed = datetime.fromisoformat(value)
+        if style == "z":
+            return f"{parsed.isoformat()}Z"
+        if style == "offset":
+            offset = timezone(timedelta(hours=5, minutes=30))
+            return parsed.replace(tzinfo=offset).isoformat()
+        raise ValueError(style)
+
+    return replace(
+        snapshot,
+        trade_server_time=convert(snapshot.trade_server_time),
+        symbol=replace(snapshot.symbol, quote_time=convert(snapshot.symbol.quote_time or "")),
+        m1_candles=tuple(replace(item, time=convert(item.time)) for item in snapshot.m1_candles),
+        m5_candles=tuple(replace(item, time=convert(item.time)) for item in snapshot.m5_candles),
+        recent_ticks=tuple(replace(item, time=convert(item.time)) for item in snapshot.recent_ticks),
+    )
+
+
 class MarketGateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.config = MarketGateConfig()
@@ -227,14 +248,86 @@ class MarketGateTests(unittest.TestCase):
         self.assertFalse(result.free_margin_sufficient)
         self.assertIn("insufficient_free_margin", result.rejection_reasons)
 
-    def test_same_completed_m1_candle_is_rejected_on_second_evaluation(self) -> None:
+    def test_rejected_candle_can_become_eligible_then_be_explicitly_reserved(self) -> None:
         gate = MarketGate(self.config)
-        first = gate.evaluate(_snapshot())
-        second = gate.evaluate(_snapshot())
-        self.assertTrue(first.eligible_for_ai)
-        self.assertFalse(second.eligible_for_ai)
-        self.assertTrue(second.duplicate_completed_m1)
-        self.assertIn("duplicate_completed_m1_candle", second.rejection_reasons)
+        tracker = CandidateEvaluationTracker()
+        snapshot = _snapshot()
+        wide_spread = replace(snapshot.symbol, ask=snapshot.symbol.bid + 1.0)
+
+        rejected = gate.evaluate(replace(snapshot, symbol=wide_spread))
+        rejected_reservation = tracker.reserve_for_ai(snapshot.symbol.symbol, rejected)
+        consumed_after_rejection = tracker.is_consumed(
+            snapshot.symbol.symbol, rejected.completed_m1_time or ""
+        )
+        improved = gate.evaluate(snapshot)
+        first_reservation = tracker.reserve_for_ai(snapshot.symbol.symbol, improved)
+        second_reservation = tracker.reserve_for_ai(snapshot.symbol.symbol, improved)
+
+        self.assertFalse(rejected.eligible_for_ai)
+        self.assertFalse(rejected_reservation.reserved_for_ai)
+        self.assertFalse(consumed_after_rejection)
+        self.assertTrue(improved.eligible_for_ai)
+        self.assertTrue(first_reservation.reserved_for_ai)
+        self.assertFalse(second_reservation.reserved_for_ai)
+        self.assertTrue(second_reservation.already_consumed)
+        self.assertEqual(second_reservation.reason, "completed_m1_already_consumed")
+
+    def test_naive_mt5_timestamps_are_supported(self) -> None:
+        result = MarketGate(self.config).evaluate(_snapshot())
+        self.assertTrue(result.eligible_for_ai)
+
+    def test_utc_z_timestamps_are_supported(self) -> None:
+        result = MarketGate(self.config).evaluate(_timestamp_style(_snapshot(), "z"))
+        self.assertTrue(result.eligible_for_ai)
+
+    def test_offset_aware_timestamps_are_supported(self) -> None:
+        result = MarketGate(self.config).evaluate(_timestamp_style(_snapshot(), "offset"))
+        self.assertTrue(result.eligible_for_ai)
+
+    def test_future_timestamp_within_skew_is_fresh(self) -> None:
+        snapshot = _snapshot()
+        future = (SERVER_TIME + timedelta(seconds=1)).isoformat()
+        ticks = (*snapshot.recent_ticks[:-1], replace(snapshot.recent_ticks[-1], time=future))
+        result = MarketGate(self.config).evaluate(
+            replace(snapshot, symbol=replace(snapshot.symbol, quote_time=future), recent_ticks=ticks)
+        )
+        self.assertTrue(result.quote_fresh)
+        self.assertTrue(result.tick_fresh)
+        self.assertTrue(result.eligible_for_ai)
+
+    def test_future_timestamp_beyond_skew_fails_closed(self) -> None:
+        snapshot = _snapshot()
+        future = (SERVER_TIME + timedelta(seconds=3)).isoformat()
+        result = MarketGate(self.config).evaluate(
+            replace(snapshot, symbol=replace(snapshot.symbol, quote_time=future))
+        )
+        self.assertFalse(result.quote_fresh)
+        self.assertFalse(result.eligible_for_ai)
+        self.assertIn("stale_or_missing_quote", result.rejection_reasons)
+
+    def test_malformed_timestamp_fails_closed(self) -> None:
+        snapshot = _snapshot()
+        result = MarketGate(self.config).evaluate(
+            replace(snapshot, symbol=replace(snapshot.symbol, quote_time="not-a-timestamp"))
+        )
+        self.assertFalse(result.quote_fresh)
+        self.assertFalse(result.eligible_for_ai)
+
+    def test_mixed_naive_and_aware_timestamps_fail_closed(self) -> None:
+        snapshot = _snapshot()
+        aware_quote = f"{snapshot.symbol.quote_time}Z"
+        result = MarketGate(self.config).evaluate(
+            replace(snapshot, symbol=replace(snapshot.symbol, quote_time=aware_quote))
+        )
+        self.assertFalse(result.quote_fresh)
+        self.assertFalse(result.eligible_for_ai)
+
+    def test_malformed_server_timestamp_fails_closed(self) -> None:
+        result = MarketGate(self.config).evaluate(
+            replace(_snapshot(), trade_server_time="malformed")
+        )
+        self.assertFalse(result.eligible_for_ai)
+        self.assertTrue(result.rejection_reasons[0].startswith("market_gate_internal_error:"))
 
 
 if __name__ == "__main__":

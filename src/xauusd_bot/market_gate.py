@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from collections.abc import Sequence
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
 from .analysis import average_candle_range, candle_range, short_term_direction
 from .config import MarketGateConfig
@@ -14,16 +14,10 @@ from .models import (
     MarketGateResult,
     XAUUSDMarketSnapshot,
 )
+from .timestamps import TimestampError, parse_timestamp, seconds_between
 
 
 LOGGER = logging.getLogger(__name__)
-
-
-def _parse_timestamp(value: str) -> datetime:
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-    return parsed
 
 
 def _completed_candles(
@@ -33,13 +27,10 @@ def _completed_candles(
 ) -> list[Candle]:
     completed: list[Candle] = []
     for item in candles:
-        try:
-            opening_time = _parse_timestamp(item.time)
-        except ValueError:
-            continue
-        if opening_time + duration <= server_time:
+        opening_time = parse_timestamp(item.time)
+        if seconds_between(server_time, opening_time) >= duration.total_seconds():
             completed.append(item)
-    completed.sort(key=lambda item: item.time)
+    completed.sort(key=lambda item: parse_timestamp(item.time))
     return completed
 
 
@@ -47,9 +38,23 @@ def _age_seconds(server_time: datetime, value: str | None) -> float | None:
     if not value:
         return None
     try:
-        return (server_time - _parse_timestamp(value)).total_seconds()
-    except ValueError:
+        return seconds_between(server_time, parse_timestamp(value))
+    except TimestampError:
         return None
+
+
+def _latest_tick_time(snapshot: XAUUSDMarketSnapshot, server_time: datetime) -> str | None:
+    if not snapshot.recent_ticks:
+        return None
+    parsed: list[tuple[datetime, str]] = []
+    for tick in snapshot.recent_ticks:
+        value = parse_timestamp(tick.time)
+        # This explicit compatibility check prevents max() from comparing mixed
+        # naive and aware datetimes.
+        seconds_between(server_time, value)
+        parsed.append((value, tick.time))
+    parsed.sort(key=lambda pair: pair[0])
+    return parsed[-1][1]
 
 
 def _ratio(numerator: float, denominator: float) -> float | None:
@@ -99,23 +104,22 @@ class MarketGate:
 
     def __init__(self, config: MarketGateConfig) -> None:
         self._config = config
-        self._last_completed_m1_by_symbol: dict[str, str] = {}
 
     def evaluate(self, snapshot: XAUUSDMarketSnapshot) -> MarketGateResult:
         try:
             return self._evaluate(snapshot)
         except Exception as exc:  # A gate must never fail open.
-            LOGGER.exception("Market gate failed closed due to %s", type(exc).__name__)
+            LOGGER.debug("Market gate failed closed due to %s", type(exc).__name__)
             return self._failed_closed(snapshot, type(exc).__name__)
 
     def _evaluate(self, snapshot: XAUUSDMarketSnapshot) -> MarketGateResult:
         config = self._config
-        server_time = _parse_timestamp(snapshot.trade_server_time)
+        server_time = parse_timestamp(snapshot.trade_server_time)
         point = snapshot.symbol.point
         reasons: list[str] = []
 
         quote_age = _age_seconds(server_time, snapshot.symbol.quote_time)
-        latest_tick_time = snapshot.recent_ticks[-1].time if snapshot.recent_ticks else None
+        latest_tick_time = _latest_tick_time(snapshot, server_time)
         tick_age = _age_seconds(server_time, latest_tick_time)
         quote_fresh = self._is_fresh(quote_age, config.max_quote_age_seconds)
         tick_fresh = self._is_fresh(tick_age, config.max_tick_age_seconds)
@@ -135,15 +139,6 @@ class MarketGate:
         if not market_active:
             reasons.append("market_inactive")
 
-        history_sufficient = (
-            len(snapshot.m1_candles) >= config.min_m1_candles
-            and len(snapshot.m5_candles) >= config.min_m5_candles
-        )
-        if len(snapshot.m1_candles) < config.min_m1_candles:
-            reasons.append("insufficient_m1_history")
-        if len(snapshot.m5_candles) < config.min_m5_candles:
-            reasons.append("insufficient_m5_history")
-
         tick_history_sufficient = len(snapshot.recent_ticks) >= config.min_recent_ticks
         if not tick_history_sufficient:
             reasons.append("insufficient_recent_tick_history")
@@ -154,13 +149,21 @@ class MarketGate:
         if completed_m1_time is None:
             reasons.append("no_completed_m1_candle")
 
-        duplicate = False
-        symbol_key = snapshot.symbol.symbol.upper()
-        if completed_m1_time is not None:
-            duplicate = self._last_completed_m1_by_symbol.get(symbol_key) == completed_m1_time
-            self._last_completed_m1_by_symbol[symbol_key] = completed_m1_time
-        if duplicate:
-            reasons.append("duplicate_completed_m1_candle")
+        required_m1 = max(
+            config.min_m1_candles,
+            config.spike_lookback_bars + 1,
+            config.direction_m1_bars,
+        )
+        required_m5 = max(
+            config.min_m5_candles,
+            config.spike_lookback_bars + 1,
+            config.direction_m5_bars,
+        )
+        history_sufficient = len(completed_m1) >= required_m1 and len(completed_m5) >= required_m5
+        if len(completed_m1) < required_m1:
+            reasons.append("insufficient_m1_history")
+        if len(completed_m5) < required_m5:
+            reasons.append("insufficient_m5_history")
 
         m1_latest_points, m1_baseline_points, m1_spike_ratio = _spike_metrics(
             completed_m1, point, config.spike_lookback_bars
@@ -219,6 +222,7 @@ class MarketGate:
         if config.require_directional_alignment and not directions_aligned:
             reasons.append("m1_m5_directions_not_aligned")
 
+        symbol_key = snapshot.symbol.symbol.upper()
         existing_position = any(
             position.symbol.upper() == symbol_key for position in snapshot.positions
         )
@@ -247,7 +251,6 @@ class MarketGate:
             direction_m5=direction_m5,
             directions_aligned=directions_aligned,
             existing_position=existing_position,
-            duplicate_completed_m1=duplicate,
             completed_m1_time=completed_m1_time,
             rejection_reasons=unique_reasons,
             metrics=MarketGateMetrics(
@@ -263,6 +266,8 @@ class MarketGate:
                 m5_spike_ratio=_rounded(m5_spike_ratio),
                 m1_candle_count=len(snapshot.m1_candles),
                 m5_candle_count=len(snapshot.m5_candles),
+                m1_completed_candle_count=len(completed_m1),
+                m5_completed_candle_count=len(completed_m5),
                 recent_tick_count=len(snapshot.recent_ticks),
                 free_margin=snapshot.account.free_margin,
             ),
@@ -293,7 +298,6 @@ class MarketGate:
             direction_m5="FLAT",
             directions_aligned=False,
             existing_position=bool(snapshot.positions),
-            duplicate_completed_m1=False,
             completed_m1_time=None,
             rejection_reasons=(f"market_gate_internal_error:{error_type}",),
             metrics=MarketGateMetrics(
@@ -309,6 +313,8 @@ class MarketGate:
                 m5_spike_ratio=None,
                 m1_candle_count=len(snapshot.m1_candles),
                 m5_candle_count=len(snapshot.m5_candles),
+                m1_completed_candle_count=0,
+                m5_completed_candle_count=0,
                 recent_tick_count=len(snapshot.recent_ticks),
                 free_margin=snapshot.account.free_margin,
             ),

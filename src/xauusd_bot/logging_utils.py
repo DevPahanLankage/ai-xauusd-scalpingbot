@@ -41,4 +41,5 @@ def configure_logging(level: str, secrets: Iterable[str] = ()) -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpx2").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("httpcore2").setLevel(logging.WARNING)
     logging.getLogger("mcp.client.streamable_http").setLevel(logging.ERROR)

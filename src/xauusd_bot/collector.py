@@ -15,10 +15,10 @@ from .models import (
     Tick,
     XAUUSDMarketSnapshot,
 )
+from .timestamps import TimestampError, mcp_timestamp, parse_timestamp, seconds_between
 
 
 LOGGER = logging.getLogger(__name__)
-REQUIRED_CANDLES = 100
 
 
 def _number(data: dict[str, Any], key: str, default: float = 0.0) -> float:
@@ -32,15 +32,31 @@ def _integer(data: dict[str, Any], key: str, default: int = 0) -> int:
 
 
 def _parse_server_time(value: str) -> datetime:
-    normalized = value.rstrip("Z")
     try:
-        return datetime.fromisoformat(normalized)
-    except ValueError as exc:
+        return parse_timestamp(value)
+    except TimestampError as exc:
         raise MCPToolError(f"Invalid trade-server time: {value}") from exc
 
 
-def _server_timestamp(value: datetime) -> str:
-    return value.replace(microsecond=0).isoformat()
+def _ordered_history(
+    history: list[Candle],
+    server_time: datetime,
+    duration: timedelta,
+) -> tuple[list[Candle], list[Candle]]:
+    try:
+        parsed = [(parse_timestamp(candle.time), candle) for candle in history]
+        for opening_time, _ in parsed:
+            seconds_between(server_time, opening_time)
+    except TimestampError as exc:
+        raise MCPToolError("Candle timestamps cannot be compared safely") from exc
+    parsed.sort(key=lambda pair: pair[0])
+    ordered = [candle for _, candle in parsed]
+    completed = [
+        candle
+        for opening_time, candle in parsed
+        if seconds_between(server_time, opening_time) >= duration.total_seconds()
+    ]
+    return ordered, completed
 
 
 def _gold_score(symbol: dict[str, Any]) -> int | None:
@@ -107,8 +123,26 @@ class XAUUSDCollector:
             raise MCPToolError("get_time_information returned no usable server time")
         server_time = _parse_server_time(server_time_text)
 
-        m1 = await self._fetch_candles(symbol_name, "M1", server_time, timedelta(hours=12))
-        m5 = await self._fetch_candles(symbol_name, "M5", server_time, timedelta(days=3))
+        m1_duration = timedelta(minutes=1)
+        m5_duration = timedelta(minutes=5)
+        m1_required = self._settings.required_m1_completed_candles
+        m5_required = self._settings.required_m5_completed_candles
+        m1 = await self._fetch_candles(
+            symbol_name,
+            "M1",
+            server_time,
+            max(timedelta(hours=12), m1_duration * (m1_required * 2)),
+            m1_duration,
+            m1_required,
+        )
+        m5 = await self._fetch_candles(
+            symbol_name,
+            "M5",
+            server_time,
+            max(timedelta(days=3), m5_duration * (m5_required * 2)),
+            m5_duration,
+            m5_required,
+        )
         tick_reference_time = server_time
         if symbol_data.get("update_time"):
             tick_reference_time = _parse_server_time(str(symbol_data["update_time"]))
@@ -190,18 +224,32 @@ class XAUUSDCollector:
         period: str,
         server_time: datetime,
         initial_lookback: timedelta,
+        duration: timedelta,
+        required_completed: int,
     ) -> list[Candle]:
-        history = await self._request_history(symbol, period, server_time, initial_lookback)
-        if len(history) < REQUIRED_CANDLES:
-            expanded = timedelta(days=7 if period == "M1" else 14)
-            history = await self._request_history(symbol, period, server_time, expanded)
-        if len(history) < REQUIRED_CANDLES:
-            raise MCPToolError(
-                f"Only {len(history)} {period} candles were available for {symbol}; "
-                f"{REQUIRED_CANDLES} are required"
+        request_limit = max(10_000, required_completed * 2 + 10)
+        history = await self._request_history(
+            symbol, period, server_time, initial_lookback, request_limit
+        )
+        _, completed = _ordered_history(history, server_time, duration)
+        if len(completed) < required_completed:
+            expanded = max(
+                timedelta(days=7 if period == "M1" else 14),
+                duration * (required_completed * 5),
             )
-        history.sort(key=lambda candle: candle.time)
-        return history[-REQUIRED_CANDLES:]
+            history = await self._request_history(
+                symbol, period, server_time, expanded, request_limit
+            )
+            _, completed = _ordered_history(history, server_time, duration)
+        if len(completed) < required_completed:
+            raise MCPToolError(
+                f"Only {len(completed)} completed {period} candles were available for {symbol}; "
+                f"{required_completed} are required by configuration"
+            )
+
+        # Snapshot history intentionally contains completed bars only. This keeps
+        # defaults at 100 while guaranteeing that all configured lookbacks are usable.
+        return completed[-required_completed:]
 
     async def _request_history(
         self,
@@ -209,15 +257,16 @@ class XAUUSDCollector:
         period: str,
         server_time: datetime,
         lookback: timedelta,
+        limit: int,
     ) -> list[Candle]:
         response = await self._client.call_tool(
             "get_chart_history",
             {
                 "symbol": symbol,
                 "period": period,
-                "datetime_from": _server_timestamp(server_time - lookback),
-                "datetime_to": _server_timestamp(server_time + timedelta(minutes=1)),
-                "limit": 10_000,
+                "datetime_from": mcp_timestamp(server_time - lookback),
+                "datetime_to": mcp_timestamp(server_time + timedelta(minutes=1)),
+                "limit": limit,
             },
         )
         return [self._build_candle(item) for item in response.get("history", [])]
@@ -227,15 +276,22 @@ class XAUUSDCollector:
             "get_chart_ticks_history",
             {
                 "symbol": symbol,
-                "datetime_from": _server_timestamp(
+                "datetime_from": mcp_timestamp(
                     server_time - timedelta(minutes=self._settings.tick_lookback_minutes)
                 ),
-                "datetime_to": _server_timestamp(server_time + timedelta(minutes=1)),
+                "datetime_to": mcp_timestamp(server_time + timedelta(minutes=1)),
                 "limit": self._settings.tick_request_limit,
             },
         )
         ticks = [self._build_tick(item) for item in response.get("history", [])]
-        ticks.sort(key=lambda tick: tick.time)
+        try:
+            parsed_ticks = [(parse_timestamp(tick.time), tick) for tick in ticks]
+            for tick_time, _ in parsed_ticks:
+                seconds_between(server_time, tick_time)
+        except TimestampError as exc:
+            raise MCPToolError("Tick timestamps cannot be compared safely") from exc
+        parsed_ticks.sort(key=lambda pair: pair[0])
+        ticks = [tick for _, tick in parsed_ticks]
         return ticks[-self._settings.tick_snapshot_limit :]
 
     @staticmethod

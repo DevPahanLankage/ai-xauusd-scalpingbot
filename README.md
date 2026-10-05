@@ -23,8 +23,8 @@ or positions.
 Before any future AI integration can receive a snapshot, `MarketGate` checks quote
 and tick freshness, active-market state, absolute and volatility-relative spread,
 history sufficiency, spike conditions, M1/M5 direction and alignment, existing
-XAUUSD exposure, free margin, and duplicate completed M1 candles. Any critical
-failure sets `eligible_for_ai` to `false`.
+XAUUSD exposure, and free margin. Any critical failure sets `eligible_for_ai`
+to `false`.
 
 ## Setup
 
@@ -63,6 +63,8 @@ configured lookback. A move smaller than 10% of the recent average M1 candle ran
 is classified as `FLAT`; otherwise it is `UP` or `DOWN`.
 
 All gate thresholds are defined together in `MarketGateConfig` and can be overridden
-with the `XAUUSD_GATE_*` variables documented in `.env.example`. Completed-M1
-deduplication is process-local; a long-running collector must reuse the same
-`MarketGate` instance across polling cycles.
+with the `XAUUSD_GATE_*` variables documented in `.env.example`. `MarketGate` is pure:
+inspecting an ineligible snapshot never consumes its completed M1 candle. A future AI
+caller must explicitly call `CandidateEvaluationTracker.reserve_for_ai()` after an
+eligible result. Reservations are process-local, so a long-running process must reuse
+the same tracker across polling cycles.

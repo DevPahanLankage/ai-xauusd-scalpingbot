@@ -118,6 +118,25 @@ class Settings:
     market_gate: MarketGateConfig = field(default_factory=MarketGateConfig)
     log_level: str = "INFO"
 
+    @property
+    def required_m1_completed_candles(self) -> int:
+        return max(
+            self.market_gate.min_m1_candles,
+            self.market_gate.spike_lookback_bars + 1,
+            self.market_gate.direction_m1_bars,
+            self.average_range_bars,
+            self.direction_bars,
+        )
+
+    @property
+    def required_m5_completed_candles(self) -> int:
+        return max(
+            self.market_gate.min_m5_candles,
+            self.market_gate.spike_lookback_bars + 1,
+            self.market_gate.direction_m5_bars,
+            self.average_range_bars,
+        )
+
     @classmethod
     def from_environment(cls) -> "Settings":
         url = os.getenv("MT5_MCP_URL", "").strip()
