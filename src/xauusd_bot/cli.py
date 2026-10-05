@@ -14,7 +14,15 @@ from .economic_calendar import EconomicCalendarCollector, EconomicCalendarGate
 from .logging_utils import configure_logging
 from .market_gate import MarketGate
 from .mcp_client import MT5ReadOnlyClient
-from .output import advisory_to_human, advisory_to_json, to_human, to_json
+from .output import (
+    advisory_to_human,
+    advisory_to_json,
+    preview_to_human,
+    preview_to_json,
+    to_human,
+    to_json,
+)
+from .preview import AIPreviewService
 from .state_store import SQLiteStateStore
 
 
@@ -37,6 +45,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Display persisted AI usage without contacting MT5 or OpenAI",
     )
+    mode.add_argument(
+        "--ai-preview",
+        action="store_true",
+        help="Inspect the exact eligible AI payload without OpenAI or state writes",
+    )
     return parser
 
 
@@ -47,11 +60,7 @@ async def _run(settings: Settings, json_output: bool) -> None:
     print(to_json(snapshot, gate) if json_output else to_human(snapshot, gate))
 
 
-async def _run_ai(settings: Settings, json_output: bool) -> None:
-    if not settings.ai.api_key:
-        LOGGER.warning(
-            "OPENAI_API_KEY is not configured; an otherwise eligible candidate will be skipped"
-        )
+async def _collect_ai_context(settings: Settings):
     news_gate_engine = EconomicCalendarGate(settings.news_gate)
     async with MT5ReadOnlyClient(settings) as client:
         snapshot = await XAUUSDCollector(client, settings).collect()
@@ -66,6 +75,15 @@ async def _run_ai(settings: Settings, json_output: bool) -> None:
             news_gate = news_gate_engine.unavailable(
                 f"calendar_unavailable:{type(exc).__name__}"
             )
+    return snapshot, market_gate, news_gate
+
+
+async def _run_ai(settings: Settings, json_output: bool) -> None:
+    if not settings.ai.api_key:
+        LOGGER.warning(
+            "OPENAI_API_KEY is not configured; an otherwise eligible candidate will be skipped"
+        )
+    snapshot, market_gate, news_gate = await _collect_ai_context(settings)
     outcome = await AIAdvisoryService(settings.ai).evaluate(
         snapshot, market_gate, news_gate
     )
@@ -76,8 +94,17 @@ async def _run_ai(settings: Settings, json_output: bool) -> None:
     )
 
 
+async def _run_ai_preview(settings: Settings, json_output: bool) -> None:
+    snapshot, market_gate, news_gate = await _collect_ai_context(settings)
+    preview = AIPreviewService(settings.ai).evaluate(snapshot, market_gate, news_gate)
+    print(preview_to_json(preview) if json_output else preview_to_human(preview))
+
+
 def _print_usage(config: AIConfig, json_output: bool) -> None:
-    summary = SQLiteStateStore(config.state_db_path).usage_summary()
+    summary = SQLiteStateStore(
+        config.state_db_path,
+        legacy_reserve_usd=config.budget_reserve_per_call_usd,
+    ).usage_summary()
     if json_output:
         import json
 
@@ -85,10 +112,18 @@ def _print_usage(config: AIConfig, json_output: bool) -> None:
         return
     print("OpenAI advisory usage (local persisted estimate)")
     print("=" * 47)
-    print(f"Calls today         : {summary.calls_today}")
-    print(f"Spend today USD     : {summary.estimated_spend_today_usd:.6f}")
-    print(f"Calls this week     : {summary.calls_this_week}")
-    print(f"Spend this week USD : {summary.estimated_spend_this_week_usd:.6f}")
+    print(f"Calls today                 : {summary.calls_today}")
+    print(f"Known spend today USD       : {summary.known_spend_today_usd:.6f}")
+    print(
+        "Budget-accounted today USD  : "
+        f"{summary.budget_accounted_spend_today_usd:.6f}"
+    )
+    print(f"Calls this week             : {summary.calls_this_week}")
+    print(f"Known spend this week USD   : {summary.known_spend_this_week_usd:.6f}")
+    print(
+        "Budget-accounted week USD   : "
+        f"{summary.budget_accounted_spend_this_week_usd:.6f}"
+    )
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -116,7 +151,13 @@ def main(argv: list[str] | None = None) -> None:
         secrets=(settings.mcp_token or "", settings.ai.api_key or ""),
     )
     try:
-        asyncio.run(_run_ai(settings, args.json) if args.ai else _run(settings, args.json))
+        if args.ai:
+            coroutine = _run_ai(settings, args.json)
+        elif args.ai_preview:
+            coroutine = _run_ai_preview(settings, args.json)
+        else:
+            coroutine = _run(settings, args.json)
+        asyncio.run(coroutine)
     except Exception as exc:
         # The formatter redacts the configured token if an upstream exception ever
         # includes it. Authentication headers are never logged intentionally.

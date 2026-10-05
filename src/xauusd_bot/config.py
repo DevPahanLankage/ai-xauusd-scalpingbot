@@ -168,7 +168,10 @@ class AIConfig:
     weekly_spend_cap_usd: float = 5.00
     input_usd_per_million: float = 2.00
     cached_input_usd_per_million: float = 0.10
+    cache_write_usd_per_million: float = 2.50
     output_usd_per_million: float = 10.00
+    budget_reserve_per_call_usd: float = 0.05
+    max_price_distance_volatility_multiple: float = 10.0
     state_db_path: Path = Path(".state/xauusd_bot.sqlite3")
 
     @classmethod
@@ -200,8 +203,17 @@ class AIConfig:
             cached_input_usd_per_million=_non_negative_float(
                 "OPENAI_CACHED_INPUT_USD_PER_MILLION", 0.10
             ),
+            cache_write_usd_per_million=_non_negative_float(
+                "OPENAI_CACHE_WRITE_USD_PER_MILLION", 2.50
+            ),
             output_usd_per_million=_non_negative_float(
                 "OPENAI_OUTPUT_USD_PER_MILLION", 10.00
+            ),
+            budget_reserve_per_call_usd=_positive_float(
+                "OPENAI_BUDGET_RESERVE_PER_CALL_USD", 0.05
+            ),
+            max_price_distance_volatility_multiple=_positive_float(
+                "OPENAI_MAX_PRICE_DISTANCE_VOLATILITY_MULTIPLE", 10.0
             ),
             state_db_path=Path(state_path),
         )

@@ -7,6 +7,36 @@ from typing import Any
 
 from .economic_calendar import EconomicNewsEvent, EconomicNewsGateResult
 from .models import Candle, MarketGateResult, Tick, XAUUSDMarketSnapshot
+from .timestamps import TimestampError, canonical_timestamp, parse_timestamp
+
+
+class PayloadValidationError(ValueError):
+    """Raised before reservation when a sanitized AI payload is unsafe."""
+
+
+FORBIDDEN_PAYLOAD_KEYS = frozenset(
+    {
+        "account",
+        "account_login",
+        "login",
+        "owner",
+        "broker",
+        "balance",
+        "equity",
+        "free_margin",
+        "used_margin",
+        "margin",
+        "api_key",
+        "openai_api_key",
+        "mcp_token",
+        "authorization",
+        "authorization_header",
+        "credential",
+        "credentials",
+        "secret",
+        "secrets",
+    }
+)
 
 
 def _candle(item: Candle) -> dict[str, Any]:
@@ -123,3 +153,122 @@ def payload_hash(payload: dict[str, Any]) -> str:
         payload, allow_nan=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _validate_tree(value: Any, path: str = "payload") -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            normalized = str(key).strip().lower().replace("-", "_").replace(" ", "_")
+            if normalized in FORBIDDEN_PAYLOAD_KEYS:
+                raise PayloadValidationError(f"forbidden payload field: {path}.{key}")
+            _validate_tree(item, f"{path}.{key}")
+        return
+    if isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            _validate_tree(item, f"{path}[{index}]")
+        return
+    if isinstance(value, float) and not math.isfinite(value):
+        raise PayloadValidationError(f"non-finite numeric value: {path}")
+
+
+def _validate_candle_order(candles: Any, label: str, required: int) -> None:
+    if not isinstance(candles, list) or len(candles) < required:
+        raise PayloadValidationError(f"insufficient {label} payload history")
+    try:
+        times = [parse_timestamp(str(item["time"])) for item in candles]
+    except (KeyError, TypeError, TimestampError) as exc:
+        raise PayloadValidationError(f"invalid {label} candle timestamp") from exc
+    try:
+        unordered = any(right <= left for left, right in zip(times, times[1:]))
+    except TypeError as exc:
+        raise PayloadValidationError(
+            f"{label} candle timestamps use incompatible timezone forms"
+        ) from exc
+    if unordered:
+        raise PayloadValidationError(f"{label} candles are not strictly chronological")
+
+
+def validate_ai_payload(
+    payload: dict[str, Any],
+    snapshot: XAUUSDMarketSnapshot,
+    market_gate: MarketGateResult,
+    news_gate: EconomicNewsGateResult,
+    *,
+    m1_required: int,
+    m5_required: int,
+) -> None:
+    """Validate the exact outbound payload before any persistent reservation."""
+
+    if not market_gate.eligible_for_ai:
+        raise PayloadValidationError("MarketGate rejected the candidate")
+    if not news_gate.safe_for_ai:
+        raise PayloadValidationError("NewsGate rejected the candidate")
+    if not market_gate.completed_m1_time:
+        raise PayloadValidationError("candidate has no completed M1 identity")
+
+    instrument = payload.get("instrument")
+    if not isinstance(instrument, dict):
+        raise PayloadValidationError("payload instrument is missing")
+    payload_symbol = str(instrument.get("symbol", ""))
+    snapshot_symbol = snapshot.symbol.symbol
+    description = snapshot.symbol.description.upper()
+    if (
+        not snapshot.symbol.selected
+        or payload_symbol != snapshot_symbol
+        or ("XAUUSD" not in snapshot_symbol.upper() and "GOLD" not in description)
+    ):
+        raise PayloadValidationError("payload symbol is not the selected broker gold symbol")
+    try:
+        bid = float(instrument["bid"])
+        ask = float(instrument["ask"])
+        point = float(instrument["point"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PayloadValidationError("payload quote is malformed") from exc
+    if any(not math.isfinite(value) for value in (bid, ask, point)):
+        raise PayloadValidationError("payload quote contains a non-finite value")
+    if bid <= 0 or ask <= bid or point <= 0:
+        raise PayloadValidationError("payload bid/ask/point relationship is invalid")
+
+    m1 = payload.get("completed_m1_candles")
+    m5 = payload.get("completed_m5_candles")
+    _validate_candle_order(m1, "M1", m1_required)
+    _validate_candle_order(m5, "M5", m5_required)
+    try:
+        payload_candidate = canonical_timestamp(str(m1[-1]["time"]))
+        gate_candidate = canonical_timestamp(market_gate.completed_m1_time)
+    except (KeyError, TypeError, TimestampError) as exc:
+        raise PayloadValidationError("candidate M1 identity is invalid") from exc
+    if payload_candidate != gate_candidate:
+        raise PayloadValidationError("latest payload M1 does not match the candidate")
+
+    _validate_tree(payload)
+    try:
+        json.dumps(payload, allow_nan=False, sort_keys=True, separators=(",", ":"))
+    except (TypeError, ValueError) as exc:
+        raise PayloadValidationError("payload is not strict finite JSON") from exc
+
+
+def build_validated_ai_payload(
+    snapshot: XAUUSDMarketSnapshot,
+    market_gate: MarketGateResult,
+    news_gate: EconomicNewsGateResult,
+    *,
+    m1_limit: int,
+    m5_limit: int,
+) -> dict[str, Any]:
+    payload = build_ai_payload(
+        snapshot,
+        market_gate,
+        news_gate,
+        m1_limit=m1_limit,
+        m5_limit=m5_limit,
+    )
+    validate_ai_payload(
+        payload,
+        snapshot,
+        market_gate,
+        news_gate,
+        m1_required=m1_limit,
+        m5_required=m5_limit,
+    )
+    return payload

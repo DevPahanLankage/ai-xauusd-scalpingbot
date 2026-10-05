@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import sqlite3
 from contextlib import closing
 from dataclasses import asdict, dataclass
@@ -10,6 +11,9 @@ from typing import Any
 from .ai_models import AdvisoryResult
 from .config import AIConfig
 from .timestamps import TimestampError, canonical_timestamp
+
+
+LEGACY_MIGRATION_RESERVE_USD = 0.05
 
 
 @dataclass(frozen=True, slots=True)
@@ -24,9 +28,24 @@ class AttemptReservation:
 @dataclass(frozen=True, slots=True)
 class UsageSummary:
     calls_today: int
-    estimated_spend_today_usd: float
+    known_spend_today_usd: float
+    budget_accounted_spend_today_usd: float
     calls_this_week: int
-    estimated_spend_this_week_usd: float
+    known_spend_this_week_usd: float
+    budget_accounted_spend_this_week_usd: float
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetStatus:
+    can_reserve: bool
+    rejection_reasons: tuple[str, ...]
+    reserve_per_call_usd: float
+    daily_spend_cap_usd: float
+    weekly_spend_cap_usd: float
+    max_calls_per_day: int
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -45,16 +64,103 @@ def _period_starts(now: datetime) -> tuple[str, str]:
     return today.isoformat(), week.isoformat()
 
 
+def evaluate_budget(summary: UsageSummary, config: AIConfig) -> BudgetStatus:
+    """Evaluate visible budget state; the write transaction stays authoritative."""
+
+    reserve = config.budget_reserve_per_call_usd
+    reasons: list[str] = []
+    if summary.calls_today >= config.max_calls_per_day:
+        reasons.append("daily_call_limit")
+    if summary.budget_accounted_spend_today_usd + reserve > config.daily_spend_cap_usd:
+        reasons.append("daily_spend_limit")
+    if (
+        summary.budget_accounted_spend_this_week_usd + reserve
+        > config.weekly_spend_cap_usd
+    ):
+        reasons.append("weekly_spend_limit")
+    return BudgetStatus(
+        can_reserve=not reasons,
+        rejection_reasons=tuple(reasons),
+        reserve_per_call_usd=reserve,
+        daily_spend_cap_usd=config.daily_spend_cap_usd,
+        weekly_spend_cap_usd=config.weekly_spend_cap_usd,
+        max_calls_per_day=config.max_calls_per_day,
+    )
+
+
+def _summary_from_connection(
+    connection: sqlite3.Connection, now: datetime
+) -> UsageSummary:
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    if "api_usage" not in tables:
+        return UsageSummary(0, 0.0, 0.0, 0, 0.0, 0.0)
+    columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(api_usage)")
+    }
+    budget_expression = (
+        "COALESCE(SUM(budget_accounted_usd), 0.0)"
+        if "budget_accounted_usd" in columns
+        else "COALESCE(SUM(estimated_cost_usd), 0.0)"
+    )
+    today_start, week_start = _period_starts(now)
+
+    def period(start: str) -> sqlite3.Row:
+        return connection.execute(
+            f"""
+            SELECT COUNT(*) AS calls,
+                   COALESCE(SUM(estimated_cost_usd), 0.0) AS known_spend,
+                   {budget_expression} AS budget_spend
+            FROM api_usage WHERE timestamp >= ?
+            """,
+            (start,),
+        ).fetchone()
+
+    daily = period(today_start)
+    weekly = period(week_start)
+    return UsageSummary(
+        calls_today=int(daily["calls"]),
+        known_spend_today_usd=round(float(daily["known_spend"]), 8),
+        budget_accounted_spend_today_usd=round(float(daily["budget_spend"]), 8),
+        calls_this_week=int(weekly["calls"]),
+        known_spend_this_week_usd=round(float(weekly["known_spend"]), 8),
+        budget_accounted_spend_this_week_usd=round(float(weekly["budget_spend"]), 8),
+    )
+
+
 class SQLiteStateStore:
     """Atomic candidate reservation and conservative API usage accounting."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(
+        self,
+        path: Path,
+        legacy_reserve_usd: float = LEGACY_MIGRATION_RESERVE_USD,
+    ) -> None:
+        if not math.isfinite(legacy_reserve_usd) or legacy_reserve_usd < 0:
+            raise ValueError("Legacy migration reserve must be finite and non-negative")
         self.path = path
+        self._legacy_reserve_usd = legacy_reserve_usd
         path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=30.0, isolation_level=None)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA busy_timeout = 30000")
+        return connection
+
+    @staticmethod
+    def _connect_read_only(path: Path) -> sqlite3.Connection:
+        connection = sqlite3.connect(
+            f"{path.resolve().as_uri()}?mode=ro",
+            uri=True,
+            timeout=30.0,
+            isolation_level=None,
+        )
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout = 30000")
         return connection
@@ -82,9 +188,12 @@ class SQLiteStateStore:
                     model TEXT NOT NULL,
                     input_tokens INTEGER,
                     cached_input_tokens INTEGER,
+                    cache_write_tokens INTEGER,
                     output_tokens INTEGER,
                     reasoning_tokens INTEGER,
                     estimated_cost_usd REAL,
+                    budget_reserved_usd REAL NOT NULL DEFAULT 0.0,
+                    budget_accounted_usd REAL NOT NULL DEFAULT 0.0,
                     status TEXT NOT NULL,
                     latency_ms REAL,
                     FOREIGN KEY (symbol, completed_m1_time)
@@ -94,6 +203,43 @@ class SQLiteStateStore:
                     ON api_usage(timestamp);
                 """
             )
+            # Serialize and atomically apply additive migrations. If the process
+            # exits midway, closing the uncommitted connection rolls them back.
+            connection.execute("BEGIN IMMEDIATE")
+            columns = {
+                str(row[1]) for row in connection.execute("PRAGMA table_info(api_usage)")
+            }
+            if "cache_write_tokens" not in columns:
+                connection.execute(
+                    "ALTER TABLE api_usage ADD COLUMN cache_write_tokens INTEGER"
+                )
+            if "budget_reserved_usd" not in columns:
+                connection.execute(
+                    "ALTER TABLE api_usage ADD COLUMN budget_reserved_usd "
+                    "REAL NOT NULL DEFAULT 0.0"
+                )
+                connection.execute(
+                    "UPDATE api_usage SET budget_reserved_usd = ?",
+                    (self._legacy_reserve_usd,),
+                )
+            if "budget_accounted_usd" not in columns:
+                connection.execute(
+                    "ALTER TABLE api_usage ADD COLUMN budget_accounted_usd "
+                    "REAL NOT NULL DEFAULT 0.0"
+                )
+                connection.execute(
+                    """
+                    UPDATE api_usage SET budget_accounted_usd =
+                        CASE
+                            WHEN estimated_cost_usd IS NOT NULL
+                                 AND estimated_cost_usd >= 0
+                                THEN estimated_cost_usd
+                            ELSE ?
+                        END
+                    """,
+                    (self._legacy_reserve_usd,),
+                )
+            connection.commit()
 
     def begin_ai_attempt(
         self,
@@ -141,7 +287,7 @@ class SQLiteStateStore:
                 daily = connection.execute(
                     """
                     SELECT COUNT(*) AS calls,
-                           COALESCE(SUM(estimated_cost_usd), 0.0) AS spend
+                           COALESCE(SUM(budget_accounted_usd), 0.0) AS spend
                     FROM api_usage WHERE timestamp >= ?
                     """,
                     (today_start,),
@@ -149,22 +295,23 @@ class SQLiteStateStore:
                 weekly = connection.execute(
                     """
                     SELECT COUNT(*) AS calls,
-                           COALESCE(SUM(estimated_cost_usd), 0.0) AS spend
+                           COALESCE(SUM(budget_accounted_usd), 0.0) AS spend
                     FROM api_usage WHERE timestamp >= ?
                     """,
                     (week_start,),
                 ).fetchone()
+                reserve = config.budget_reserve_per_call_usd
                 if int(daily["calls"]) >= config.max_calls_per_day:
                     connection.rollback()
                     return AttemptReservation(
                         False, "daily_call_limit", None, normalized_symbol, candle_time
                     )
-                if float(daily["spend"]) >= config.daily_spend_cap_usd:
+                if float(daily["spend"]) + reserve > config.daily_spend_cap_usd:
                     connection.rollback()
                     return AttemptReservation(
                         False, "daily_spend_limit", None, normalized_symbol, candle_time
                     )
-                if float(weekly["spend"]) >= config.weekly_spend_cap_usd:
+                if float(weekly["spend"]) + reserve > config.weekly_spend_cap_usd:
                     connection.rollback()
                     return AttemptReservation(
                         False, "weekly_spend_limit", None, normalized_symbol, candle_time
@@ -188,10 +335,18 @@ class SQLiteStateStore:
                 cursor = connection.execute(
                     """
                     INSERT INTO api_usage
-                        (timestamp, symbol, completed_m1_time, model, status)
-                    VALUES (?, ?, ?, ?, 'reserved')
+                        (timestamp, symbol, completed_m1_time, model, status,
+                         budget_reserved_usd, budget_accounted_usd)
+                    VALUES (?, ?, ?, ?, 'reserved', ?, ?)
                     """,
-                    (reserved_at, normalized_symbol, candle_time, config.model),
+                    (
+                        reserved_at,
+                        normalized_symbol,
+                        candle_time,
+                        config.model,
+                        reserve,
+                        reserve,
+                    ),
                 )
                 usage_id = int(cursor.lastrowid)
                 connection.commit()
@@ -210,6 +365,8 @@ class SQLiteStateStore:
         if not reservation.reserved or reservation.usage_id is None:
             raise ValueError("Cannot finish an unreserved AI attempt")
         usage = result.usage
+        actual = result.estimated_cost_usd
+        known_actual = actual is not None and math.isfinite(actual) and actual >= 0
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -217,16 +374,22 @@ class SQLiteStateStore:
                     """
                     UPDATE api_usage SET
                         input_tokens = ?, cached_input_tokens = ?,
-                        output_tokens = ?, reasoning_tokens = ?,
-                        estimated_cost_usd = ?, status = ?, latency_ms = ?
+                        cache_write_tokens = ?, output_tokens = ?,
+                        reasoning_tokens = ?, estimated_cost_usd = ?,
+                        budget_accounted_usd = CASE
+                            WHEN ? THEN ? ELSE budget_accounted_usd END,
+                        status = ?, latency_ms = ?
                     WHERE id = ?
                     """,
                     (
                         usage.input_tokens if usage else None,
                         usage.cached_input_tokens if usage else None,
+                        usage.cache_write_tokens if usage else None,
                         usage.output_tokens if usage else None,
                         usage.reasoning_tokens if usage else None,
-                        result.estimated_cost_usd,
+                        actual if known_actual else None,
+                        known_actual,
+                        actual if known_actual else None,
                         result.status,
                         result.latency_ms,
                         reservation.usage_id,
@@ -250,27 +413,52 @@ class SQLiteStateStore:
 
     def usage_summary(self, now: datetime | None = None) -> UsageSummary:
         timestamp = _utc_now(now)
-        today_start, week_start = _period_starts(timestamp)
         with closing(self._connect()) as connection:
-            daily = connection.execute(
-                """
-                SELECT COUNT(*) AS calls,
-                       COALESCE(SUM(estimated_cost_usd), 0.0) AS spend
-                FROM api_usage WHERE timestamp >= ?
-                """,
-                (today_start,),
-            ).fetchone()
-            weekly = connection.execute(
-                """
-                SELECT COUNT(*) AS calls,
-                       COALESCE(SUM(estimated_cost_usd), 0.0) AS spend
-                FROM api_usage WHERE timestamp >= ?
-                """,
-                (week_start,),
-            ).fetchone()
-        return UsageSummary(
-            calls_today=int(daily["calls"]),
-            estimated_spend_today_usd=round(float(daily["spend"]), 8),
-            calls_this_week=int(weekly["calls"]),
-            estimated_spend_this_week_usd=round(float(weekly["spend"]), 8),
-        )
+            return _summary_from_connection(connection, timestamp)
+
+    @classmethod
+    def usage_summary_read_only(
+        cls, path: Path, now: datetime | None = None
+    ) -> UsageSummary:
+        """Inspect usage without creating a file, applying migrations, or writing WAL."""
+
+        timestamp = _utc_now(now)
+        if not path.is_file():
+            return UsageSummary(0, 0.0, 0.0, 0, 0.0, 0.0)
+        try:
+            with closing(cls._connect_read_only(path)) as connection:
+                return _summary_from_connection(connection, timestamp)
+        except sqlite3.Error:
+            return UsageSummary(0, 0.0, 0.0, 0, 0.0, 0.0)
+
+    @classmethod
+    def candidate_consumed_read_only(
+        cls, path: Path, symbol: str, completed_m1_time: str
+    ) -> bool:
+        """Check candidate state without creating or mutating the SQLite database."""
+
+        if not path.is_file():
+            return False
+        try:
+            candidate = canonical_timestamp(completed_m1_time)
+            with closing(cls._connect_read_only(path)) as connection:
+                tables = {
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    ).fetchall()
+                }
+                if "candidate_reservations" not in tables:
+                    return False
+                return (
+                    connection.execute(
+                        """
+                        SELECT 1 FROM candidate_reservations
+                        WHERE symbol = ? AND completed_m1_time = ?
+                        """,
+                        (symbol.upper(), candidate),
+                    ).fetchone()
+                    is not None
+                )
+        except (sqlite3.Error, TimestampError):
+            return False

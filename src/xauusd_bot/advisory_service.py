@@ -10,7 +10,7 @@ from .ai_models import AdvisoryResult, safe_no_trade
 from .config import AIConfig
 from .economic_calendar import EconomicNewsGateResult
 from .models import MarketGateResult, XAUUSDMarketSnapshot
-from .payload import build_ai_payload, payload_hash
+from .payload import build_validated_ai_payload, payload_hash
 from .state_store import AttemptReservation, SQLiteStateStore
 
 
@@ -56,7 +56,7 @@ class AIAdvisoryService:
             return self._skipped("missing_completed_m1_candle")
 
         try:
-            payload = build_ai_payload(
+            payload = build_validated_ai_payload(
                 snapshot,
                 market_gate,
                 news_gate,
@@ -69,7 +69,10 @@ class AIAdvisoryService:
             return self._skipped("invalid_sanitized_payload")
 
         try:
-            store = self._state_store or SQLiteStateStore(self._config.state_db_path)
+            store = self._state_store or SQLiteStateStore(
+                self._config.state_db_path,
+                legacy_reserve_usd=self._config.budget_reserve_per_call_usd,
+            )
             advisor = self._advisor or OpenAIAdvisor(self._config)
         except Exception as exc:
             LOGGER.warning("AI advisory initialization failed closed (%s)", type(exc).__name__)
@@ -107,7 +110,8 @@ class AIAdvisoryService:
         LOGGER.info(
             "AI advisory candidate=%s input_hash=%s model=%s effort=%s "
             "decision=%s confidence=%d entry=%s sl=%s tp=%s rr=%s "
-            "input_tokens=%s cached_tokens=%s output_tokens=%s reasoning_tokens=%s "
+            "input_tokens=%s cached_tokens=%s cache_write_tokens=%s "
+            "output_tokens=%s reasoning_tokens=%s "
             "cost_usd=%s latency_ms=%.3f status=%s",
             reservation.completed_m1_time,
             input_hash,
@@ -121,6 +125,7 @@ class AIAdvisoryService:
             decision.risk_reward_ratio,
             result.usage.input_tokens if result.usage else None,
             result.usage.cached_input_tokens if result.usage else None,
+            result.usage.cache_write_tokens if result.usage else None,
             result.usage.output_tokens if result.usage else None,
             result.usage.reasoning_tokens if result.usage else None,
             result.estimated_cost_usd,

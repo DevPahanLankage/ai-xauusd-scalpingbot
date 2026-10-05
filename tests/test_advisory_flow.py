@@ -110,6 +110,25 @@ class AdvisoryFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(outcome.attempted)
         self.assertEqual(outcome.skip_reason, "missing_openai_api_key")
 
+    async def test_invalid_payload_is_rejected_before_candidate_reservation(self) -> None:
+        snapshot = _snapshot()
+        market = MarketGate(MarketGateConfig()).evaluate(snapshot)
+        malformed = replace(
+            snapshot,
+            m1_candles=(
+                *snapshot.m1_candles[:-2],
+                snapshot.m1_candles[-1],
+                snapshot.m1_candles[-2],
+            ),
+        )
+        outcome = await AIAdvisoryService(
+            self.config, state_store=self.store, advisor=self.advisor
+        ).evaluate(malformed, market, safe_news())
+        self.assertFalse(outcome.attempted)
+        self.assertEqual(outcome.skip_reason, "invalid_sanitized_payload")
+        self.assertEqual(self.advisor.calls, 0)
+        self.assertEqual(self.store.usage_summary().calls_today, 0)
+
     def test_payload_excludes_account_login_funds_and_secrets(self) -> None:
         snapshot = _snapshot()
         market = MarketGate(MarketGateConfig()).evaluate(snapshot)
@@ -139,10 +158,26 @@ class CLISafetyTests(unittest.TestCase):
             patch.object(cli.Settings, "from_environment", return_value=settings),
             patch.object(cli, "_run", new=AsyncMock()) as normal,
             patch.object(cli, "_run_ai", new=AsyncMock()) as ai,
+            patch.object(cli, "_run_ai_preview", new=AsyncMock()) as preview,
             patch.object(cli, "load_dotenv"),
         ):
             cli.main([])
         normal.assert_awaited_once()
+        ai.assert_not_awaited()
+        preview.assert_not_awaited()
+
+    def test_preview_cli_never_selects_paid_ai_path(self) -> None:
+        settings = Settings(mcp_url="http://127.0.0.1/mcp")
+        with (
+            patch.object(cli.Settings, "from_environment", return_value=settings),
+            patch.object(cli, "_run", new=AsyncMock()) as normal,
+            patch.object(cli, "_run_ai", new=AsyncMock()) as ai,
+            patch.object(cli, "_run_ai_preview", new=AsyncMock()) as preview,
+            patch.object(cli, "load_dotenv"),
+        ):
+            cli.main(["--ai-preview"])
+        preview.assert_awaited_once()
+        normal.assert_not_awaited()
         ai.assert_not_awaited()
 
 

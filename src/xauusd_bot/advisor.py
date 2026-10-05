@@ -27,12 +27,23 @@ loss above entry and take profit below entry. Use null price fields for NO_TRADE
 
 
 def estimate_cost(usage: TokenUsage, config: AIConfig) -> float:
-    cached = min(max(usage.cached_input_tokens, 0), max(usage.input_tokens, 0))
-    uncached = max(usage.input_tokens - cached, 0)
+    total_input = max(usage.input_tokens, 0)
+    # If malformed details exceed the total, allocate the finite total to the
+    # higher-priced cache-write category first so the estimate stays conservative.
+    cache_write = min(
+        max(usage.cache_write_tokens, 0),
+        total_input,
+    )
+    cached = min(
+        max(usage.cached_input_tokens, 0),
+        max(total_input - cache_write, 0),
+    )
+    ordinary = max(total_input - cached - cache_write, 0)
     return round(
         (
-            uncached * config.input_usd_per_million
+            ordinary * config.input_usd_per_million
             + cached * config.cached_input_usd_per_million
+            + cache_write * config.cache_write_usd_per_million
             + max(usage.output_tokens, 0) * config.output_usd_per_million
         )
         / 1_000_000,
@@ -54,6 +65,7 @@ def extract_usage(response: Any) -> TokenUsage | None:
     return TokenUsage(
         input_tokens=_integer_attr(usage, "input_tokens"),
         cached_input_tokens=_integer_attr(input_details, "cached_tokens"),
+        cache_write_tokens=_integer_attr(input_details, "cache_write_tokens"),
         output_tokens=_integer_attr(usage, "output_tokens"),
         reasoning_tokens=_integer_attr(output_details, "reasoning_tokens"),
     )
@@ -77,7 +89,29 @@ def _entry(decision: AITradeDecision) -> float | None:
     return (decision.entry_zone_low + decision.entry_zone_high) / 2.0
 
 
-def validate_decision(decision: AITradeDecision) -> AITradeDecision:
+def _market_sanity_limit(payload: dict[str, Any], config: AIConfig) -> tuple[float, float] | None:
+    try:
+        instrument = payload["instrument"]
+        context = payload["market_context"]
+        bid = float(instrument["bid"])
+        ask = float(instrument["ask"])
+        point = float(instrument["point"])
+        m1_range = float(context["m1_average_range_points"]) * point
+        m5_range = float(context["m5_average_range_points"]) * point
+    except (KeyError, TypeError, ValueError):
+        return None
+    values = (bid, ask, point, m1_range, m5_range)
+    if any(not math.isfinite(value) or value <= 0 for value in values) or ask <= bid:
+        return None
+    reference_range = max(m1_range, m5_range)
+    return (bid + ask) / 2.0, reference_range * config.max_price_distance_volatility_multiple
+
+
+def validate_decision(
+    decision: AITradeDecision,
+    payload: dict[str, Any],
+    config: AIConfig,
+) -> AITradeDecision:
     numeric = (
         decision.entry_price,
         decision.entry_zone_low,
@@ -121,6 +155,23 @@ def validate_decision(decision: AITradeDecision) -> AITradeDecision:
     tolerance = max(0.05, calculated * 0.05)
     if not math.isfinite(calculated) or abs(reported_ratio - calculated) > tolerance:
         return safe_no_trade("invalid_risk_reward_calculation")
+    sanity = _market_sanity_limit(payload, config)
+    if sanity is None:
+        return safe_no_trade("missing_or_invalid_market_sanity_context")
+    current_price, maximum_distance = sanity
+    proposed_prices = [
+        value
+        for value in (
+            decision.entry_price,
+            decision.entry_zone_low,
+            decision.entry_zone_high,
+            stop,
+            target,
+        )
+        if value is not None
+    ]
+    if any(abs(value - current_price) > maximum_distance for value in proposed_prices):
+        return safe_no_trade("recommendation_detached_from_current_market")
     return decision.model_copy(update={"risk_reward_ratio": round(calculated, 4)})
 
 
@@ -157,6 +208,7 @@ class OpenAIAdvisor:
                 ],
                 text_format=AITradeDecision,
                 max_output_tokens=self._config.max_output_tokens,
+                store=False,
             )
             usage = extract_usage(response)
             parsed = getattr(response, "output_parsed", None)
@@ -164,7 +216,7 @@ class OpenAIAdvisor:
                 status = "refusal_or_unparsed"
                 decision = safe_no_trade("model_refused_or_returned_no_parsed_output")
             else:
-                decision = validate_decision(parsed)
+                decision = validate_decision(parsed, payload, self._config)
                 status = (
                     "success"
                     if decision.decision == parsed.decision

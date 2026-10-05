@@ -5,6 +5,7 @@ import json
 from .advisory_service import AIAdvisoryOutcome
 from .economic_calendar import EconomicNewsGateResult
 from .models import MarketGateResult, XAUUSDMarketSnapshot
+from .preview import AIPreviewResult
 
 
 def to_json(snapshot: XAUUSDMarketSnapshot, gate: MarketGateResult) -> str:
@@ -191,4 +192,60 @@ def advisory_to_human(
                 f"Estimated cost USD  : {outcome.result.estimated_cost_usd}",
             ]
         )
+    return "\n".join(lines)
+
+
+def preview_to_json(preview: AIPreviewResult) -> str:
+    """Render only sanitised preview state; never include the account snapshot."""
+
+    return json.dumps(
+        {"ai_preview": preview.to_dict(include_payload=True)},
+        indent=2,
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+
+
+def preview_to_human(preview: AIPreviewResult) -> str:
+    usage = preview.usage
+    budget = preview.budget
+    lines = [
+        "OpenAI Advisory Preview (zero API calls / zero state writes)",
+        "=" * 57,
+        f"Gold symbol         : {preview.symbol}",
+        f"Completed M1        : {preview.completed_m1_time or 'unavailable'}",
+        f"MarketGate eligible : {str(preview.market_gate_eligible).lower()}",
+        f"NewsGate safe       : {str(preview.news_gate_safe).lower()}",
+        f"Candidate consumed  : {str(preview.candidate_consumed).lower()}",
+        f"Model / effort      : {preview.model} / {preview.reasoning_effort}",
+        f"Credentials set     : {str(preview.credentials_configured).lower()}",
+        f"Payload hash        : {preview.input_hash or 'not built'}",
+        f"Would request       : {str(preview.would_request).lower()}",
+        "",
+        "Configured budget (read-only)",
+        "=" * 29,
+        f"Calls today         : {usage.calls_today} / {budget.max_calls_per_day}",
+        f"Known spend today   : ${usage.known_spend_today_usd:.6f}",
+        (
+            "Budget spend today  : "
+            f"${usage.budget_accounted_spend_today_usd:.6f} / "
+            f"${budget.daily_spend_cap_usd:.6f}"
+        ),
+        f"Calls this week     : {usage.calls_this_week}",
+        f"Known spend week    : ${usage.known_spend_this_week_usd:.6f}",
+        (
+            "Budget spend week   : "
+            f"${usage.budget_accounted_spend_this_week_usd:.6f} / "
+            f"${budget.weekly_spend_cap_usd:.6f}"
+        ),
+        f"Per-call reserve    : ${budget.reserve_per_call_usd:.6f}",
+    ]
+    if preview.market_gate_reasons:
+        lines.append("Market gate reasons : " + ", ".join(preview.market_gate_reasons))
+    if preview.news_gate_reasons:
+        lines.append("News gate reasons   : " + ", ".join(preview.news_gate_reasons))
+    if preview.skip_reasons:
+        lines.append("Paid call skipped   : " + ", ".join(preview.skip_reasons))
+    else:
+        lines.append("Paid call skipped   : no (preview still makes no request)")
     return "\n".join(lines)
