@@ -9,15 +9,26 @@ description = "Read-only XAUUSD market collector with news-aware AI advisory mod
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "fastapi>=0.119,<1",
     "httpx2>=2.10,<3",
     "mcp>=2.3.0,<3",
     "openai>=3.24,<4",
     "pydantic>=2.13,<3",
     "python-dotenv>=1.1,<2",
+    "rich>=14.2,<15",
+    "uvicorn>=0.38,<1",
+    "websockets>=15,<17",
 ]
+
+[project.optional-dependencies]
+desktop-build = ["pyinstaller>=6.16,<7"]
 
 [project.scripts]
 xauusd-snapshot = "xauusd_bot.cli:main"
+xauusd-desktop = "xauusd_bot.desktop:main"
+
+[tool.setuptools.package-data]
+xauusd_bot = ["web_dist/**/*"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

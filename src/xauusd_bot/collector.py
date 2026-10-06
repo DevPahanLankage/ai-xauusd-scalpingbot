@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -182,6 +183,118 @@ class XAUUSDCollector:
             m1_candles=tuple(m1),
             m5_candles=tuple(m5),
             recent_ticks=tuple(ticks),
+            metrics=metrics,
+        )
+
+    async def refresh_light(
+        self, snapshot: XAUUSDMarketSnapshot
+    ) -> XAUUSDMarketSnapshot:
+        """Refresh time and quote while reusing histories and account state."""
+
+        time_data = await self._client.call_tool("get_time_information", {})
+        server_time_text = str(
+            time_data.get("trade_server_last_known_time")
+            or time_data.get("local_time")
+            or time_data.get("utc_time")
+            or ""
+        )
+        if not server_time_text:
+            raise MCPToolError("get_time_information returned no usable server time")
+        _parse_server_time(server_time_text)
+        quote_data = await self._exact_visible_symbol(snapshot.symbol.symbol)
+        if quote_data is None:
+            raise MCPToolError(
+                f"Detected symbol {snapshot.symbol.symbol} is no longer visible in Market Watch"
+            )
+        symbol = self._build_symbol(quote_data)
+        ticks = list(snapshot.recent_ticks)
+        if symbol.quote_time:
+            sampled = Tick(time=symbol.quote_time, bid=symbol.bid, ask=symbol.ask)
+            if not ticks or (
+                ticks[-1].time,
+                ticks[-1].bid,
+                ticks[-1].ask,
+            ) != (sampled.time, sampled.bid, sampled.ask):
+                ticks.append(sampled)
+        ticks = ticks[-self._settings.tick_snapshot_limit :]
+        metrics = calculate_metrics(
+            bid=symbol.bid,
+            ask=symbol.ask,
+            point=symbol.point,
+            digits=symbol.digits,
+            m1_candles=snapshot.m1_candles,
+            m5_candles=snapshot.m5_candles,
+            average_range_bars=self._settings.average_range_bars,
+            direction_bars=self._settings.direction_bars,
+        )
+        return replace(
+            snapshot,
+            captured_at_utc=datetime.now(timezone.utc).isoformat(),
+            trade_server_time=server_time_text,
+            symbol=symbol,
+            recent_ticks=tuple(ticks),
+            metrics=metrics,
+        )
+
+    async def refresh_account(
+        self, snapshot: XAUUSDMarketSnapshot
+    ) -> XAUUSDMarketSnapshot:
+        """Refresh only account funds and XAUUSD exposure."""
+
+        account_data = await self._client.call_tool("get_trading_account_info", {})
+        positions_data = await self._client.call_tool(
+            "get_trading_open_positions",
+            {"symbol": snapshot.symbol.symbol, "include_orders": False},
+        )
+        positions = tuple(
+            self._build_position(item)
+            for item in positions_data.get("positions", [])
+            if str(item.get("symbol", "")).upper() == snapshot.symbol.symbol.upper()
+        )
+        return replace(
+            snapshot,
+            account=self._build_account(account_data),
+            positions=positions,
+        )
+
+    async def refresh_history(
+        self, snapshot: XAUUSDMarketSnapshot
+    ) -> XAUUSDMarketSnapshot:
+        """Refresh completed M1/M5 history after a new M1 close."""
+
+        server_time = _parse_server_time(snapshot.trade_server_time)
+        m1_required = self._settings.required_m1_completed_candles
+        m5_required = self._settings.required_m5_completed_candles
+        m1 = await self._fetch_candles(
+            snapshot.symbol.symbol,
+            "M1",
+            server_time,
+            max(timedelta(hours=12), timedelta(minutes=m1_required * 2)),
+            timedelta(minutes=1),
+            m1_required,
+        )
+        m5 = await self._fetch_candles(
+            snapshot.symbol.symbol,
+            "M5",
+            server_time,
+            max(timedelta(days=3), timedelta(minutes=5 * m5_required * 2)),
+            timedelta(minutes=5),
+            m5_required,
+        )
+        metrics = calculate_metrics(
+            bid=snapshot.symbol.bid,
+            ask=snapshot.symbol.ask,
+            point=snapshot.symbol.point,
+            digits=snapshot.symbol.digits,
+            m1_candles=m1,
+            m5_candles=m5,
+            average_range_bars=self._settings.average_range_bars,
+            direction_bars=self._settings.direction_bars,
+        )
+        return replace(
+            snapshot,
+            m1_candles=tuple(m1),
+            m5_candles=tuple(m5),
             metrics=metrics,
         )
 

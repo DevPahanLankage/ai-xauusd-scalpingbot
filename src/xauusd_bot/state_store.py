@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import math
 import sqlite3
 import stat
@@ -204,6 +205,7 @@ class SQLiteStateStore:
                     output_tokens INTEGER,
                     reasoning_tokens INTEGER,
                     estimated_cost_usd REAL,
+                    advisory_json TEXT,
                     budget_reserved_usd REAL NOT NULL DEFAULT 0.0,
                     budget_accounted_usd REAL NOT NULL DEFAULT 0.0,
                     status TEXT NOT NULL,
@@ -224,6 +226,10 @@ class SQLiteStateStore:
             if "cache_write_tokens" not in columns:
                 connection.execute(
                     "ALTER TABLE api_usage ADD COLUMN cache_write_tokens INTEGER"
+                )
+            if "advisory_json" not in columns:
+                connection.execute(
+                    "ALTER TABLE api_usage ADD COLUMN advisory_json TEXT"
                 )
             if "budget_reserved_usd" not in columns:
                 connection.execute(
@@ -388,6 +394,7 @@ class SQLiteStateStore:
                         input_tokens = ?, cached_input_tokens = ?,
                         cache_write_tokens = ?, output_tokens = ?,
                         reasoning_tokens = ?, estimated_cost_usd = ?,
+                        advisory_json = ?,
                         budget_accounted_usd = CASE
                             WHEN ? THEN ? ELSE budget_accounted_usd END,
                         status = ?, latency_ms = ?
@@ -400,6 +407,7 @@ class SQLiteStateStore:
                         usage.output_tokens if usage else None,
                         usage.reasoning_tokens if usage else None,
                         actual if known_actual else None,
+                        json.dumps(result.to_dict(), allow_nan=False, separators=(",", ":")),
                         known_actual,
                         actual if known_actual else None,
                         result.status,
@@ -530,3 +538,97 @@ class SQLiteStateStore:
                 return ReadOnlyStateInspection(True, usage, consumed)
         except (OSError, sqlite3.Error, TimestampError):
             return ReadOnlyStateInspection(False, None, None)
+
+    @classmethod
+    def last_advisory_read_only(cls, path: Path) -> dict[str, Any] | None:
+        """Return the newest persisted advisory metadata without mutating state."""
+
+        try:
+            mode = path.stat().st_mode
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise PersistentStateUnavailableError(
+                "Existing persistent state cannot be safely inspected"
+            ) from exc
+        if not stat.S_ISREG(mode):
+            raise PersistentStateUnavailableError(
+                "Existing persistent state cannot be safely inspected"
+            )
+        try:
+            with closing(cls._connect_read_only(path)) as connection:
+                columns = {
+                    str(row[1])
+                    for row in connection.execute("PRAGMA table_info(api_usage)")
+                }
+                required = {
+                    "timestamp",
+                    "completed_m1_time",
+                    "model",
+                    "status",
+                    "input_tokens",
+                    "cached_input_tokens",
+                    "output_tokens",
+                    "reasoning_tokens",
+                    "estimated_cost_usd",
+                    "latency_ms",
+                }
+                if not required <= columns:
+                    raise PersistentStateUnavailableError(
+                        "Persistent advisory history has an unsupported schema"
+                    )
+                cache_write = (
+                    "u.cache_write_tokens" if "cache_write_tokens" in columns else "NULL"
+                )
+                advisory_json = (
+                    "u.advisory_json" if "advisory_json" in columns else "NULL"
+                )
+                row = connection.execute(
+                    f"""
+                    SELECT u.timestamp, u.completed_m1_time, u.model, u.status,
+                           u.input_tokens, u.cached_input_tokens,
+                           {cache_write} AS cache_write_tokens,
+                           u.output_tokens, u.reasoning_tokens,
+                           u.estimated_cost_usd, u.latency_ms,
+                           {advisory_json} AS advisory_json,
+                           c.input_hash, c.result
+                    FROM api_usage AS u
+                    LEFT JOIN candidate_reservations AS c
+                      ON c.symbol = u.symbol
+                     AND c.completed_m1_time = u.completed_m1_time
+                    ORDER BY u.id DESC LIMIT 1
+                    """
+                ).fetchone()
+                if row is None:
+                    return None
+                parsed: dict[str, Any] | None = None
+                if row["advisory_json"]:
+                    value = json.loads(str(row["advisory_json"]))
+                    if isinstance(value, dict):
+                        parsed = value
+                decision = None
+                result_text = str(row["result"] or "")
+                if ":" in result_text:
+                    decision = result_text.rsplit(":", 1)[-1]
+                return {
+                    "timestamp": row["timestamp"],
+                    "candidate_time": row["completed_m1_time"],
+                    "input_hash": row["input_hash"],
+                    "model": row["model"],
+                    "status": row["status"],
+                    "decision": decision,
+                    "usage": {
+                        "input_tokens": row["input_tokens"],
+                        "cached_input_tokens": row["cached_input_tokens"],
+                        "cache_write_tokens": row["cache_write_tokens"],
+                        "output_tokens": row["output_tokens"],
+                        "reasoning_tokens": row["reasoning_tokens"],
+                    },
+                    "estimated_cost_usd": row["estimated_cost_usd"],
+                    "latency_ms": row["latency_ms"],
+                    "result": parsed,
+                }
+        except (json.JSONDecodeError, OSError, sqlite3.Error) as exc:
+            raise PersistentStateUnavailableError(
+                "Existing persistent state cannot be safely inspected"
+            ) from exc

@@ -1,10 +1,122 @@
-# XAUUSD news-aware AI advisory
+# XAUUSD advisory engine and desktop monitor
 
 This Python application collects a typed, read-only `XAUUSDMarketSnapshot` from the
 MetaTrader 5 Terminal MCP. It applies deterministic market and USD economic-news
 gates before an optional GPT advisory. AI output is analysis only: the project has no
 order execution, order modification, EA attachment, chart mutation, or AutoTrading
 control.
+
+## Windows desktop application
+
+The repository now includes a dual-interface desktop monitor built around the
+existing Python engine. Market data is collected once, gates are calculated once,
+and a normalized, secret-free `ApplicationState` is presented by both interfaces:
+
+```text
+MT5 Terminal MCP -> existing collector / gates / preview
+                 -> shared monitoring service and application state
+                    |-> Rich live CLI
+                    `-> FastAPI + WebSocket -> React dashboard
+```
+
+The dashboard does not contain alternate gate or advisory logic. React displays
+backend truth and never talks to MT5 or OpenAI. Opening the executable, opening or
+refreshing the dashboard, and reconnecting its WebSocket make zero OpenAI requests.
+The monitor can display `AI ELIGIBLE`, but an advisory remains available only through
+the existing explicit `--ai` developer command documented below.
+
+One windowed executable supports all main launch modes:
+
+```powershell
+# Rich live console and automatic browser dashboard
+.\XAUUSD-AI.exe
+
+# Browser dashboard only; no console window
+.\XAUUSD-AI.exe --browser-only
+
+# Rich live console only; no browser or web server
+.\XAUUSD-AI.exe --cli-only
+```
+
+The local web service binds only to `127.0.0.1:8765`. The browser opens only after
+the server reports ready. Browser-only mode includes a confirmed **Exit Application**
+action; console modes support Ctrl+C. There are no BUY, SELL, order, position, or
+execution controls.
+
+### Desktop data and update behavior
+
+The monitoring service keeps one MT5 MCP connection and one collector. Bid/ask,
+server time, and spread refresh every five seconds; account/exposure refresh every
+15 seconds; news refreshes every minute. Completed M1/M5 histories are reused and
+refreshed when a new completed M1 candle is due. Both views receive the same revisioned
+state. The bounded event feed records meaningful transitions—connection, candidate,
+gate, news, and advisory changes—not raw ticks.
+
+The browser provides a dark trading-terminal layout, M1/M5 candlestick selector,
+bid/ask lines, and persisted advisory entry/zone/SL/TP levels when they exist.
+`NO_TRADE` never creates chart levels. Current candidate identity and the persisted
+last advisory are labeled separately to prevent stale decisions from appearing current.
+
+### Run the desktop app from source
+
+Build the frontend once, then start the Python desktop entry point:
+
+```powershell
+Set-Location frontend
+npm ci
+npm run lint
+npm run typecheck
+npm test
+npm run build
+Set-Location ..
+
+.venv\Scripts\python -m xauusd_bot.desktop
+.venv\Scripts\python -m xauusd_bot.desktop --browser-only
+.venv\Scripts\python -m xauusd_bot.desktop --cli-only
+```
+
+Vite is development/build tooling only. Production assets are served directly by
+FastAPI; there is no Node production server.
+
+### Build `XAUUSD-AI.exe`
+
+From a Windows PowerShell prompt:
+
+```powershell
+.\scripts\build_desktop.ps1
+```
+
+The script installs the declared frontend lockfile, runs frontend validation, builds
+the React production assets, installs the Python desktop build extra, and runs the
+PyInstaller specification. The reproducible local output is:
+
+```text
+dist\XAUUSD-AI.exe
+```
+
+Generated frontend assets, PyInstaller work files, and binaries are intentionally
+ignored by Git.
+
+### Packaged configuration
+
+The executable never contains `.env`. For packaged use, place a private `.env` beside
+`XAUUSD-AI.exe`:
+
+```text
+deployment-folder\
+  XAUUSD-AI.exe
+  .env
+```
+
+When run from source, the application reads `.env` from the current project directory.
+Do not place runtime secrets in `frontend/`; nothing from the process environment is
+serialized into browser state. The browser may receive local balance, equity, free
+margin, and position count, but never account login, broker/server identity, MCP token,
+OpenAI key, credentials, or authorization headers.
+
+### Dashboard screenshot
+
+_Placeholder: add a current dashboard screenshot after a release build is selected._
 
 ## Safety boundary
 
@@ -137,3 +249,39 @@ null token/cost fields, retain their budget reserve, and keep the candidate cons
 
 See `.env.example` for every supported `XAUUSD_NEWS_*`, `OPENAI_*`, and state-path
 override.
+
+## Troubleshooting
+
+- **Port 8765 is already in use:** stop the other local process and relaunch. The app
+  fails clearly and never falls back to a LAN-facing bind address.
+- **MT5 disconnected:** confirm the Terminal MCP endpoint/token and that the MT5
+  terminal is running. The desktop stays alive, fails closed, and retries without
+  starting OpenAI.
+- **AI NOT_CONFIGURED:** set `OPENAI_API_KEY` only if explicit advisory commands are
+  intended. Market monitoring works without it.
+- **News or persistent state unavailable:** the corresponding gate remains blocked by
+  design. Repair the source service/database rather than weakening the gate.
+- **Frontend unavailable from source:** run `npm run build` in `frontend/`. CLI-only
+  mode remains independent of frontend assets.
+- **Packaged app cannot find configuration:** verify `.env` is beside the executable,
+  not inside the repository build directory by assumption.
+
+## Development validation
+
+```powershell
+.venv\Scripts\python -m unittest discover -s tests -v
+.venv\Scripts\python -m pip check
+
+Set-Location frontend
+npm run lint
+npm run typecheck
+npm test
+npm run build
+npm audit
+```
+
+## Planned stages
+
+This release remains advisory-only. Future stages, each requiring deliberate review,
+are paper outcome tracking, strategy evaluation, demo execution, and only eventually
+live execution. None of those execution stages is implemented here.

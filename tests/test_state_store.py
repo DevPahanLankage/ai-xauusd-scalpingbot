@@ -127,6 +127,10 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(summary.known_spend_today_usd, 0.0042)
         self.assertEqual(summary.budget_accounted_spend_today_usd, 0.0042)
         self.assertEqual(summary.calls_this_week, 1)
+        latest = SQLiteStateStore.last_advisory_read_only(self.path)
+        assert latest is not None
+        self.assertEqual(latest["decision"], "NO_TRADE")
+        self.assertEqual(latest["result"]["decision"]["confidence"], 75)
 
     def test_unknown_cost_failure_retains_reserve(self) -> None:
         config = AIConfig(state_db_path=self.path, budget_reserve_per_call_usd=0.05)

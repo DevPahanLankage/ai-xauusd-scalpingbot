@@ -8,6 +8,10 @@ __pycache__/
 .ruff_cache/
 build/
 dist/
+frontend/node_modules/
+src/xauusd_bot/web_dist/
+*.log
+logs/
 .codex/config.toml
 .state/
 *.sqlite
