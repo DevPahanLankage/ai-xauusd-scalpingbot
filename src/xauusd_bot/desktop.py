@@ -280,7 +280,10 @@ def main(argv: Sequence[str] | None = None) -> None:
     configure_logging(
         settings.log_level,
         secrets=(settings.mcp_token or "", settings.ai.api_key or ""),
-        console=mode.show_cli,
+        # Raw StreamHandler writes bypass Rich Live and can scroll or corrupt
+        # the alternate-screen dashboard. Meaningful runtime transitions are
+        # already presented through the bounded RECENT EVENTS feed.
+        console=False,
     )
     try:
         asyncio.run(

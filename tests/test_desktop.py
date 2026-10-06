@@ -6,11 +6,16 @@ import socket
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
+from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
+from rich.console import Console
 
+from xauusd_bot.application_state import EventFeed, build_application_state
 from xauusd_bot.config import AIConfig, MarketGateConfig, Settings
 from xauusd_bot.desktop import (
     APP_DATA_DIRECTORY,
@@ -25,7 +30,12 @@ from xauusd_bot.desktop import (
 from xauusd_bot.economic_calendar import EconomicCalendarGate
 from xauusd_bot.market_gate import MarketGate
 from xauusd_bot.monitor import MonitoringService, StateHub
-from xauusd_bot.rich_dashboard import run_rich_dashboard
+from xauusd_bot.preview import AIPreviewService
+from xauusd_bot.rich_dashboard import (
+    _sync_console_dimensions,
+    render_dashboard,
+    run_rich_dashboard,
+)
 from xauusd_bot.webapp import _local, create_web_app
 from tests.test_market_gate import _snapshot
 
@@ -109,6 +119,107 @@ class WebApplicationTests(unittest.TestCase):
         self.assertEqual(stopped, [True])
 
 
+class DashboardRenderTests(unittest.TestCase):
+    def test_rebound_console_stream_supplies_actual_dimensions(self) -> None:
+        console = MagicMock()
+        console.file.fileno.return_value = 7
+        console.size = SimpleNamespace(width=120, height=30)
+        with patch("xauusd_bot.rich_dashboard.os.get_terminal_size") as terminal_size:
+            terminal_size.return_value = os.terminal_size((120, 30))
+            size = _sync_console_dimensions(console)
+        terminal_size.assert_called_once_with(7)
+        self.assertEqual(console.width, 120)
+        self.assertEqual(console.height, 30)
+        self.assertEqual((size.width, size.height), (120, 30))
+
+    def state(self) -> dict:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        settings = Settings(
+            mcp_url="http://127.0.0.1/mcp",
+            ai=AIConfig(state_db_path=Path(temporary.name) / "missing.sqlite3"),
+        )
+        snapshot = _snapshot()
+        gate = MarketGate(settings.market_gate).evaluate(snapshot)
+        news = EconomicCalendarGate(settings.news_gate).evaluate(
+            snapshot.trade_server_time, ()
+        )
+        preview = AIPreviewService(settings.ai).evaluate(snapshot, gate, news)
+        state = build_application_state(
+            snapshot=snapshot,
+            market_gate=gate,
+            news_gate=news,
+            preview=preview,
+            settings=settings,
+            last_advisory=None,
+            events=EventFeed(),
+            started_at=datetime.now(timezone.utc),
+            mode="combined",
+        )
+        state["ai"]["last_advisory"] = {
+            "candidate_time": "2026-10-06T12:00:00Z",
+            "model": "gpt-6.1-sol",
+            "status": "success",
+            "decision": "NO_TRADE",
+            "confidence": 88,
+            "market_regime": "range",
+            "setup_summary": "No clean entry",
+            "entry_price": None,
+            "stop_loss": None,
+            "take_profit": None,
+            "risk_reward_ratio": None,
+            "invalidation_reason": "Spread expansion",
+            "warnings": ["Demo advisory"],
+            "usage": {"input_tokens": 1000, "output_tokens": 100},
+            "estimated_cost_usd": 0.01,
+            "latency_ms": 1250,
+        }
+        state["events"] = [
+            {
+                "timestamp": f"2026-10-06T12:00:0{index}+00:00",
+                "level": "INFO",
+                "message": f"Event {index}",
+            }
+            for index in range(5)
+        ]
+        return state
+
+    def render(self, state: dict, *, width: int, height: int) -> str:
+        output = StringIO()
+        console = Console(file=output, width=width, color_system=None)
+        console.print(render_dashboard(state, width=width, height=height))
+        return output.getvalue()
+
+    def test_full_dashboard_fits_common_windows_viewport(self) -> None:
+        rendered = self.render(self.state(), width=120, height=30)
+        self.assertLessEqual(len(rendered.splitlines()), 30)
+        for title in (
+            "MARKET",
+            "MARKET GATE",
+            "VALIDITY",
+            "NEWS GATE",
+            "LAST AI ADVISORY",
+            "OPENAI / BUDGET",
+            "ACCOUNT",
+            "SYSTEM",
+            "RECENT EVENTS",
+        ):
+            self.assertIn(title, rendered)
+
+    def test_small_terminal_uses_bounded_safety_summary(self) -> None:
+        rendered = self.render(self.state(), width=80, height=20)
+        self.assertLessEqual(len(rendered.splitlines()), 20)
+        for value in (
+            "Eligible / news",
+            "Bid / ask",
+            "Spread",
+            "M1 / M5 / align",
+            "Last decision",
+            "Terminal too small",
+        ):
+            self.assertIn(value, rendered)
+
+
 class MonitorSafetyTests(unittest.IsolatedAsyncioTestCase):
     async def test_state_publish_never_initializes_openai(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -151,6 +262,7 @@ class DesktopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         stop_event = asyncio.Event()
         stop_event.set()
         console = MagicMock()
+        console.is_terminal = True
         live = MagicMock()
         with (
             patch("xauusd_bot.rich_dashboard.Console", return_value=console) as factory,
@@ -165,7 +277,51 @@ class DesktopLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(console_options["legacy_windows"])
         self.assertNotIn("TERM", console_options["_environ"])
         live_factory.assert_called_once_with(
-            console=console, refresh_per_second=4, screen=False
+            console=console,
+            screen=True,
+            auto_refresh=False,
+            vertical_overflow="crop",
+        )
+
+    async def test_rich_dashboard_uses_one_live_across_state_transitions(self) -> None:
+        stop_event = asyncio.Event()
+        console = MagicMock()
+        console.is_terminal = True
+        console.size = SimpleNamespace(width=120, height=30)
+        live_context = MagicMock()
+        live = MagicMock()
+        live_context.__enter__.return_value = live
+        calls = 0
+        states = [
+            {"name": "disconnected", "eligible": False, "candidate": None},
+            {"name": "connected-valid", "eligible": True, "candidate": "12:00"},
+            {"name": "connected-blocked", "eligible": False, "candidate": "12:00"},
+            {"name": "connected-valid", "eligible": True, "candidate": "12:01"},
+        ]
+
+        async def next_state(*_args):
+            nonlocal calls
+            state = states[calls]
+            calls += 1
+            if calls == len(states):
+                stop_event.set()
+            return calls, state
+
+        with (
+            patch("xauusd_bot.rich_dashboard.Console", return_value=console),
+            patch("xauusd_bot.rich_dashboard.Live", return_value=live_context) as factory,
+            patch("xauusd_bot.rich_dashboard.asyncio_wait_state", side_effect=next_state),
+            patch(
+                "xauusd_bot.rich_dashboard.render_dashboard", return_value=MagicMock()
+            ) as renderer,
+        ):
+            await run_rich_dashboard(MagicMock(), stop_event, force_terminal=True)
+
+        factory.assert_called_once()
+        self.assertEqual(live.update.call_count, len(states))
+        self.assertEqual(
+            [call.args[0] for call in renderer.call_args_list],
+            states,
         )
 
     async def test_cli_only_starts_no_server_or_browser_and_stops_cleanly(self) -> None:
