@@ -86,7 +86,10 @@ budget, or writing SQLite state:
 ```
 
 When both gates pass, JSON preview includes the exact sanitized payload and its hash.
-When either gate rejects, preview lists the reasons and builds no payload.
+When either gate rejects, preview lists the reasons and builds no payload. Preview
+opens existing SQLite state read-only; missing state is a valid zero-usage baseline,
+while corrupt, unreadable, locked, or structurally invalid state reports
+`persistent_state_unavailable` and blocks readiness without repairing the file.
 
 Display local usage without contacting MT5 or OpenAI:
 

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,16 +27,23 @@ class AIPreviewTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def test_eligible_preview_builds_exact_payload_without_openai_or_state(self) -> None:
+    def evaluate(self):
         with patch("xauusd_bot.advisor.OpenAIAdvisor") as advisor:
             preview = AIPreviewService(self.config).evaluate(
                 self.snapshot, self.market, safe_news()
             )
         advisor.assert_not_called()
+        return preview
+
+    def test_missing_database_is_clean_zero_state_without_creating_it(self) -> None:
+        preview = self.evaluate()
         self.assertTrue(preview.would_request)
+        self.assertTrue(preview.state_available)
+        self.assertFalse(preview.candidate_consumed)
         self.assertIsNotNone(preview.input_hash)
         self.assertIsNotNone(preview.sanitized_payload)
         self.assertFalse(self.path.exists())
+        assert preview.usage is not None
         self.assertEqual(preview.usage.calls_today, 0)
         self.assertEqual(preview.usage.budget_accounted_spend_today_usd, 0.0)
 
@@ -65,17 +74,49 @@ class AIPreviewTests(unittest.TestCase):
         self.assertTrue(reservation.reserved)
         before = store.usage_summary()
 
-        preview = AIPreviewService(self.config).evaluate(
-            self.snapshot, self.market, safe_news()
-        )
+        preview = self.evaluate()
 
         after = SQLiteStateStore.usage_summary_read_only(self.path)
         self.assertEqual(after, before)
+        self.assertTrue(preview.state_available)
         self.assertTrue(preview.candidate_consumed)
         self.assertFalse(preview.would_request)
         self.assertEqual(
             preview.skip_reasons.count("completed_m1_already_consumed"), 1
         )
+
+    def test_corrupt_existing_database_fails_closed_without_repair(self) -> None:
+        original = b"this is not a sqlite database"
+        self.path.write_bytes(original)
+
+        preview = self.evaluate()
+
+        self.assertFalse(preview.state_available)
+        self.assertIsNone(preview.usage)
+        self.assertIsNone(preview.budget)
+        self.assertIsNone(preview.candidate_consumed)
+        self.assertFalse(preview.would_request)
+        self.assertIn("persistent_state_unavailable", preview.skip_reasons)
+        self.assertEqual(self.path.read_bytes(), original)
+        rendered = json.loads(preview_to_json(preview))["ai_preview"]
+        self.assertFalse(rendered["state_available"])
+        self.assertIsNone(rendered["usage"])
+        self.assertIsNone(rendered["candidate_consumed"])
+
+    def test_sqlite_inspection_error_fails_closed_without_openai(self) -> None:
+        SQLiteStateStore(self.path)
+        with patch.object(
+            SQLiteStateStore,
+            "_connect_read_only",
+            side_effect=sqlite3.OperationalError("database is locked"),
+        ):
+            preview = self.evaluate()
+
+        self.assertFalse(preview.state_available)
+        self.assertIsNone(preview.usage)
+        self.assertIsNone(preview.candidate_consumed)
+        self.assertFalse(preview.would_request)
+        self.assertIn("persistent_state_unavailable", preview.skip_reasons)
 
 
 if __name__ == "__main__":

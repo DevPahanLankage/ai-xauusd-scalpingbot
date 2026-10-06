@@ -28,9 +28,10 @@ class AIPreviewResult:
     model: str
     reasoning_effort: str
     credentials_configured: bool
-    usage: UsageSummary
-    budget: BudgetStatus
-    candidate_consumed: bool
+    state_available: bool
+    usage: UsageSummary | None
+    budget: BudgetStatus | None
+    candidate_consumed: bool | None
     would_request: bool
     skip_reasons: tuple[str, ...]
     input_hash: str | None
@@ -55,15 +56,15 @@ class AIPreviewService:
         market_gate: MarketGateResult,
         news_gate: EconomicNewsGateResult,
     ) -> AIPreviewResult:
-        usage = SQLiteStateStore.usage_summary_read_only(self._config.state_db_path)
-        budget = evaluate_budget(usage, self._config)
         candidate = market_gate.completed_m1_time
-        consumed = bool(
-            candidate
-            and SQLiteStateStore.candidate_consumed_read_only(
-                self._config.state_db_path, snapshot.symbol.symbol, candidate
-            )
+        state = SQLiteStateStore.inspect_read_only(
+            self._config.state_db_path,
+            symbol=snapshot.symbol.symbol,
+            completed_m1_time=candidate,
         )
+        usage = state.usage
+        budget = evaluate_budget(usage, self._config) if usage is not None else None
+        consumed = state.candidate_consumed
         reasons: list[str] = []
         payload: dict[str, Any] | None = None
         digest: str | None = None
@@ -75,9 +76,12 @@ class AIPreviewService:
             reasons.append("missing_openai_credentials")
         if not candidate:
             reasons.append("missing_completed_m1_candle")
-        if consumed:
+        if not state.state_available:
+            reasons.append("persistent_state_unavailable")
+        if consumed is True:
             reasons.append("completed_m1_already_consumed")
-        reasons.extend(budget.rejection_reasons)
+        if budget is not None:
+            reasons.extend(budget.rejection_reasons)
 
         if market_gate.eligible_for_ai and news_gate.safe_for_ai and candidate:
             try:
@@ -102,6 +106,7 @@ class AIPreviewService:
             model=self._config.model,
             reasoning_effort=self._config.reasoning_effort,
             credentials_configured=bool(self._config.api_key),
+            state_available=state.state_available,
             usage=usage,
             budget=budget,
             candidate_consumed=consumed,

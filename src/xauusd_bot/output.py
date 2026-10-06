@@ -180,6 +180,26 @@ def advisory_to_human(
         lines.append(f"AI request          : skipped ({outcome.skip_reason})")
     else:
         decision = outcome.result.decision
+
+        def price_or_na(value: float | None) -> str:
+            return (
+                "n/a"
+                if value is None
+                else format(value, f".{snapshot.symbol.digits}f")
+            )
+
+        if decision.entry_price is not None:
+            entry = price_or_na(decision.entry_price)
+        elif (
+            decision.entry_zone_low is not None
+            and decision.entry_zone_high is not None
+        ):
+            entry = (
+                f"{price_or_na(decision.entry_zone_low)} - "
+                f"{price_or_na(decision.entry_zone_high)}"
+            )
+        else:
+            entry = "n/a"
         lines.extend(
             [
                 "AI request          : attempted",
@@ -187,8 +207,13 @@ def advisory_to_human(
                 f"Decision            : {decision.decision.value}",
                 f"Confidence          : {decision.confidence}",
                 f"Setup               : {decision.setup_summary}",
-                f"Entry / SL / TP     : {decision.entry_price} / {decision.stop_loss} / {decision.take_profit}",
-                f"Risk/reward         : {decision.risk_reward_ratio}",
+                f"Entry               : {entry}",
+                f"Stop loss           : {price_or_na(decision.stop_loss)}",
+                f"Take profit         : {price_or_na(decision.take_profit)}",
+                (
+                    "Risk/reward         : "
+                    f"{decision.risk_reward_ratio if decision.risk_reward_ratio is not None else 'n/a'}"
+                ),
                 f"Estimated cost USD  : {outcome.result.estimated_cost_usd}",
             ]
         )
@@ -207,8 +232,6 @@ def preview_to_json(preview: AIPreviewResult) -> str:
 
 
 def preview_to_human(preview: AIPreviewResult) -> str:
-    usage = preview.usage
-    budget = preview.budget
     lines = [
         "OpenAI Advisory Preview (zero API calls / zero state writes)",
         "=" * 57,
@@ -216,7 +239,12 @@ def preview_to_human(preview: AIPreviewResult) -> str:
         f"Completed M1        : {preview.completed_m1_time or 'unavailable'}",
         f"MarketGate eligible : {str(preview.market_gate_eligible).lower()}",
         f"NewsGate safe       : {str(preview.news_gate_safe).lower()}",
-        f"Candidate consumed  : {str(preview.candidate_consumed).lower()}",
+        f"State available     : {str(preview.state_available).lower()}",
+        (
+            "Candidate consumed  : unknown"
+            if preview.candidate_consumed is None
+            else f"Candidate consumed  : {str(preview.candidate_consumed).lower()}"
+        ),
         f"Model / effort      : {preview.model} / {preview.reasoning_effort}",
         f"Credentials set     : {str(preview.credentials_configured).lower()}",
         f"Payload hash        : {preview.input_hash or 'not built'}",
@@ -224,22 +252,31 @@ def preview_to_human(preview: AIPreviewResult) -> str:
         "",
         "Configured budget (read-only)",
         "=" * 29,
-        f"Calls today         : {usage.calls_today} / {budget.max_calls_per_day}",
-        f"Known spend today   : ${usage.known_spend_today_usd:.6f}",
-        (
-            "Budget spend today  : "
-            f"${usage.budget_accounted_spend_today_usd:.6f} / "
-            f"${budget.daily_spend_cap_usd:.6f}"
-        ),
-        f"Calls this week     : {usage.calls_this_week}",
-        f"Known spend week    : ${usage.known_spend_this_week_usd:.6f}",
-        (
-            "Budget spend week   : "
-            f"${usage.budget_accounted_spend_this_week_usd:.6f} / "
-            f"${budget.weekly_spend_cap_usd:.6f}"
-        ),
-        f"Per-call reserve    : ${budget.reserve_per_call_usd:.6f}",
     ]
+    if preview.usage is None or preview.budget is None:
+        lines.append("Persistent usage    : unavailable (fail-closed)")
+    else:
+        usage = preview.usage
+        budget = preview.budget
+        lines.extend(
+            [
+                f"Calls today         : {usage.calls_today} / {budget.max_calls_per_day}",
+                f"Known spend today   : ${usage.known_spend_today_usd:.6f}",
+                (
+                    "Budget spend today  : "
+                    f"${usage.budget_accounted_spend_today_usd:.6f} / "
+                    f"${budget.daily_spend_cap_usd:.6f}"
+                ),
+                f"Calls this week     : {usage.calls_this_week}",
+                f"Known spend week    : ${usage.known_spend_this_week_usd:.6f}",
+                (
+                    "Budget spend week   : "
+                    f"${usage.budget_accounted_spend_this_week_usd:.6f} / "
+                    f"${budget.weekly_spend_cap_usd:.6f}"
+                ),
+                f"Per-call reserve    : ${budget.reserve_per_call_usd:.6f}",
+            ]
+        )
     if preview.market_gate_reasons:
         lines.append("Market gate reasons : " + ", ".join(preview.market_gate_reasons))
     if preview.news_gate_reasons:

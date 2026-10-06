@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import sqlite3
+import stat
 from contextlib import closing
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -36,6 +37,17 @@ class UsageSummary:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class ReadOnlyStateInspection:
+    state_available: bool
+    usage: UsageSummary | None
+    candidate_consumed: bool | None
+
+
+class PersistentStateUnavailableError(RuntimeError):
+    """Raised when an existing state database cannot be safely inspected."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -422,14 +434,12 @@ class SQLiteStateStore:
     ) -> UsageSummary:
         """Inspect usage without creating a file, applying migrations, or writing WAL."""
 
-        timestamp = _utc_now(now)
-        if not path.is_file():
-            return UsageSummary(0, 0.0, 0.0, 0, 0.0, 0.0)
-        try:
-            with closing(cls._connect_read_only(path)) as connection:
-                return _summary_from_connection(connection, timestamp)
-        except sqlite3.Error:
-            return UsageSummary(0, 0.0, 0.0, 0, 0.0, 0.0)
+        inspection = cls.inspect_read_only(path, now=now)
+        if not inspection.state_available or inspection.usage is None:
+            raise PersistentStateUnavailableError(
+                "Existing persistent state cannot be safely inspected"
+            )
+        return inspection.usage
 
     @classmethod
     def candidate_consumed_read_only(
@@ -437,28 +447,86 @@ class SQLiteStateStore:
     ) -> bool:
         """Check candidate state without creating or mutating the SQLite database."""
 
-        if not path.is_file():
-            return False
+        inspection = cls.inspect_read_only(
+            path,
+            symbol=symbol,
+            completed_m1_time=completed_m1_time,
+        )
+        if (
+            not inspection.state_available
+            or inspection.candidate_consumed is None
+        ):
+            raise PersistentStateUnavailableError(
+                "Existing persistent state cannot be safely inspected"
+            )
+        return inspection.candidate_consumed
+
+    @classmethod
+    def inspect_read_only(
+        cls,
+        path: Path,
+        *,
+        symbol: str | None = None,
+        completed_m1_time: str | None = None,
+        now: datetime | None = None,
+    ) -> ReadOnlyStateInspection:
+        """Read usage and candidate state together without creating or repairing state."""
+
+        timestamp = _utc_now(now)
+        zero = UsageSummary(0, 0.0, 0.0, 0, 0.0, 0.0)
         try:
-            candidate = canonical_timestamp(completed_m1_time)
+            mode = path.stat().st_mode
+        except FileNotFoundError:
+            return ReadOnlyStateInspection(True, zero, False)
+        except OSError:
+            return ReadOnlyStateInspection(False, None, None)
+        if not stat.S_ISREG(mode):
+            return ReadOnlyStateInspection(False, None, None)
+        try:
+            candidate = (
+                canonical_timestamp(completed_m1_time)
+                if completed_m1_time is not None
+                else None
+            )
             with closing(cls._connect_read_only(path)) as connection:
+                integrity = connection.execute("PRAGMA quick_check").fetchone()
+                if integrity is None or str(integrity[0]).casefold() != "ok":
+                    return ReadOnlyStateInspection(False, None, None)
                 tables = {
                     str(row[0])
                     for row in connection.execute(
                         "SELECT name FROM sqlite_master WHERE type = 'table'"
                     ).fetchall()
                 }
-                if "candidate_reservations" not in tables:
-                    return False
-                return (
-                    connection.execute(
-                        """
-                        SELECT 1 FROM candidate_reservations
-                        WHERE symbol = ? AND completed_m1_time = ?
-                        """,
-                        (symbol.upper(), candidate),
-                    ).fetchone()
-                    is not None
-                )
-        except (sqlite3.Error, TimestampError):
-            return False
+                if not {"api_usage", "candidate_reservations"} <= tables:
+                    return ReadOnlyStateInspection(False, None, None)
+                usage_columns = {
+                    str(row[1])
+                    for row in connection.execute("PRAGMA table_info(api_usage)")
+                }
+                candidate_columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(candidate_reservations)"
+                    )
+                }
+                if not {"timestamp", "estimated_cost_usd"} <= usage_columns:
+                    return ReadOnlyStateInspection(False, None, None)
+                if not {"symbol", "completed_m1_time"} <= candidate_columns:
+                    return ReadOnlyStateInspection(False, None, None)
+                usage = _summary_from_connection(connection, timestamp)
+                consumed = False
+                if symbol is not None and candidate is not None:
+                    consumed = (
+                        connection.execute(
+                            """
+                            SELECT 1 FROM candidate_reservations
+                            WHERE symbol = ? AND completed_m1_time = ?
+                            """,
+                            (symbol.upper(), candidate),
+                        ).fetchone()
+                        is not None
+                    )
+                return ReadOnlyStateInspection(True, usage, consumed)
+        except (OSError, sqlite3.Error, TimestampError):
+            return ReadOnlyStateInspection(False, None, None)
