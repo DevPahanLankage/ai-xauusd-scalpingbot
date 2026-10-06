@@ -557,6 +557,21 @@ def build_paper_report(
                 for row in connection.execute("SELECT symbol, completed_m1_time FROM candidate_reservations")
             )
 
+        research_rows: list[dict[str, Any]] = []
+        if "research_candidates" in tables:
+            for raw in connection.execute(
+                "SELECT * FROM research_candidates ORDER BY completed_m1_time"
+            ):
+                row = dict(raw)
+                included, invalid = _in_period(row.get("captured_at"), start, end)
+                quality["timestamp_problems"] += int(invalid)
+                if included:
+                    research_rows.append(row)
+        else:
+            quality["warnings"].append(
+                "research_candidates table is missing (older database)"
+            )
+
     decisions_by_usage: dict[int, dict[str, Any]] = {}
     for row in api_rows:
         decision, malformed = _decision_data(row)
@@ -683,6 +698,21 @@ def build_paper_report(
         if isinstance(gate, dict) and gate.get("eligible_for_ai"):
             eligible_persisted += 1
     server_hours = _time_distribution(api_rows, decisions_by_usage, context_by_usage)
+    candidate_hours = Counter()
+    for row in research_rows:
+        try:
+            candidate = parse_timestamp(str(row.get("completed_m1_time")))
+            candidate_hours[f"{candidate.hour:02d}:00"] += 1
+        except TimestampError:
+            candidate_hours["UNKNOWN"] += 1
+    for hour in sorted(set(server_hours) | set(candidate_hours)):
+        server_hours.setdefault(
+            hour,
+            {
+                "calls": 0, "BUY": 0, "SELL": 0, "NO_TRADE": 0,
+                "average_confidence": None, "average_spread_points": None,
+            },
+        )["candidates"] = candidate_hours.get(hour, 0)
     if len(api_rows) >= 2 and len(server_hours) == 1:
         quality["warnings"].append(
             "All advisories fall in one MT5 server-time hour; overlapping horizons are not independent samples."
@@ -701,6 +731,23 @@ def build_paper_report(
     patterns["market_regime"] = _group_counts(
         str(decision.get("market_regime") or "UNKNOWN") for decision in no_trade_decisions
     )
+    disposition_counts = Counter(str(row.get("disposition")) for row in research_rows)
+    market_eligible = sum(bool(row.get("market_gate_eligible")) for row in research_rows)
+    market_rejected = len(research_rows) - market_eligible
+    news_blocked = sum(
+        bool(row.get("market_gate_eligible")) and not bool(row.get("news_safe"))
+        for row in research_rows
+    )
+    fully_eligible = sum(
+        bool(row.get("market_gate_eligible")) and bool(row.get("news_safe"))
+        for row in research_rows
+    )
+    sent = disposition_counts["SENT_TO_AI"] + disposition_counts["AI_ERROR"]
+    sent_decisions = [
+        str(row.get("decision")) for row in research_rows
+        if row.get("disposition") == "SENT_TO_AI" and row.get("decision") in DECISIONS
+    ]
+    directional_sent = sum(value in {"BUY", "SELL"} for value in sent_decisions)
     return {
         "schema_version": "1.0",
         "report_period": {
@@ -752,13 +799,33 @@ def build_paper_report(
             "no_trade_percentage": _percent(decision_names.count("NO_TRADE"), len(decision_names)),
             "candidate_reservations": reservations,
             "eligible_contexts_persisted_for_sent_calls": eligible_persisted,
-            "eligible_deterministic_candidates_total": None,
-            "rejected_before_gpt": None,
-            "duplicate_or_consumed_attempts": None,
-            "limitations": [
-                "The database persists reserved/sent candidates, not every MarketGate evaluation.",
-                "Pre-GPT rejections and duplicate attempts cannot be reconstructed from current state.",
+            "eligible_deterministic_candidates_total": fully_eligible if "research_candidates" in tables else None,
+            "rejected_before_gpt": market_rejected if "research_candidates" in tables else None,
+            "duplicate_or_consumed_attempts": disposition_counts["DUPLICATE"] if "research_candidates" in tables else None,
+            "limitations": [] if "research_candidates" in tables else [
+                "This older database predates deterministic candidate persistence.",
             ],
+        },
+        "deterministic_candidates": {
+            "available": "research_candidates" in tables,
+            "total": len(research_rows),
+            "market_gate_eligible": market_eligible,
+            "market_gate_rejected": market_rejected,
+            "news_blocked": news_blocked,
+            "spacing_blocked": disposition_counts["RATE_SPACING_BLOCKED"],
+            "duplicate": disposition_counts["DUPLICATE"],
+            "budget_blocked": disposition_counts["BUDGET_BLOCKED"],
+            "sent_to_ai": sent,
+            "dispositions": dict(sorted(disposition_counts.items())),
+        },
+        "ai_conversion": {
+            "eligible_deterministic_candidates": fully_eligible,
+            "sent_to_gpt": sent,
+            "BUY": sent_decisions.count("BUY"),
+            "SELL": sent_decisions.count("SELL"),
+            "NO_TRADE": sent_decisions.count("NO_TRADE"),
+            "percentage_eligible_sent": _percent(sent, fully_eligible),
+            "percentage_directional": _percent(directional_sent, len(sent_decisions)),
         },
         "time_distribution_server_hour": server_hours,
         "data_quality": quality,
@@ -766,8 +833,8 @@ def build_paper_report(
             "sent_candidate_context_available": eligible_persisted == len(api_rows) if api_rows else False,
             "gpt_selection_available": len(decisions_by_usage) == len(api_rows),
             "paper_outcomes_available": len(paper_rows) == len(successful_ids),
-            "unbiased_all_eligible_candidate_baseline_available": False,
-            "missing_for_future_unbiased_comparison": [
+            "unbiased_all_eligible_candidate_baseline_available": "research_candidates" in tables,
+            "missing_for_future_unbiased_comparison": [] if "research_candidates" in tables else [
                 "A durable record of every eligible MarketGate candidate, including candidates not sent to GPT.",
                 "Durable pre-GPT rejection and duplicate-attempt counters keyed by candidate.",
             ],
@@ -902,21 +969,34 @@ def paper_report_to_human(report: dict[str, Any]) -> str:
             f"- {theme['theme']}: {theme['count']} ({_percentage(theme['percentage'])}) - {example}"
         )
     efficiency = report["candidate_efficiency"]
+    candidates = report["deterministic_candidates"]
+    conversion = report["ai_conversion"]
     lines.extend(
         [
             "",
-            "CANDIDATE EFFICIENCY",
+            "DETERMINISTIC CANDIDATES",
+            f"Available / total    : {str(candidates['available']).lower()} / {candidates['total']}",
+            f"Eligible / rejected  : {candidates['market_gate_eligible']} / {candidates['market_gate_rejected']}",
+            f"News / spacing block : {candidates['news_blocked']} / {candidates['spacing_blocked']}",
+            f"Duplicate / budget   : {candidates['duplicate']} / {candidates['budget_blocked']}",
+            f"Sent to AI           : {candidates['sent_to_ai']}",
+            "",
+            "AI CONVERSION",
+            f"Eligible / sent      : {conversion['eligible_deterministic_candidates']} / {conversion['sent_to_gpt']}",
+            f"BUY / SELL / NO_TRADE: {conversion['BUY']} / {conversion['SELL']} / {conversion['NO_TRADE']}",
+            f"Eligible sent / directional: {_percentage(conversion['percentage_eligible_sent'])} / {_percentage(conversion['percentage_directional'])}",
+            "",
+            "CANDIDATE EFFICIENCY (legacy advisory view)",
             f"Calls / directional / NO_TRADE: {efficiency['openai_calls']} / {efficiency['directional_decisions']} / {efficiency['no_trade_decisions']}",
             f"Directional / NO_TRADE %: {_percentage(efficiency['directional_percentage'])} / {_percentage(efficiency['no_trade_percentage'])}",
             f"Reservations / eligible sent contexts: {efficiency['candidate_reservations']} / {efficiency['eligible_contexts_persisted_for_sent_calls']}",
-            "Rejected-before-GPT and duplicate-attempt totals are not reconstructable from current persistence.",
             "",
             "SERVER-TIME DISTRIBUTION",
         ]
     )
     for hour, value in report["time_distribution_server_hour"].items():
         lines.append(
-            f"{hour}: calls={value['calls']} B/S/N={value['BUY']}/{value['SELL']}/{value['NO_TRADE']} "
+            f"{hour}: candidates={value.get('candidates', 0)} calls={value['calls']} B/S/N={value['BUY']}/{value['SELL']}/{value['NO_TRADE']} "
             f"confidence={_number(value['average_confidence'], 1)} spread={_number(value['average_spread_points'], 1)} pts"
         )
     quality = report["data_quality"]
@@ -932,7 +1012,7 @@ def paper_report_to_human(report: dict[str, Any]) -> str:
             "",
             "BASELINE READINESS",
             f"Sent contexts / GPT decisions / paper: {baseline['sent_candidate_context_available']} / {baseline['gpt_selection_available']} / {baseline['paper_outcomes_available']}",
-            "Unbiased all-eligible baseline: false",
+            f"Unbiased all-eligible baseline: {str(baseline['unbiased_all_eligible_candidate_baseline_available']).lower()}",
         ]
     )
     for missing in baseline["missing_for_future_unbiased_comparison"]:

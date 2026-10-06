@@ -112,6 +112,7 @@ def _environment() -> tuple[dict[str, str], list[str]]:
                 secrets.append(value)
     # The smoke test must be incapable of making a paid request.
     environment["OPENAI_API_KEY"] = ""
+    environment["XAUUSD_AUTO_ADVISORY_ENABLED"] = "false"
     state_path = Path(
         environment.get("XAUUSD_AI_STATE_DB", ".state/xauusd_bot.sqlite3")
     ).expanduser()
@@ -135,6 +136,7 @@ def _web_mode(mode: str) -> dict[str, Any]:
             state = _request("/api/state")
         with connect(f"ws://{HOST}:{PORT}/ws", open_timeout=3) as websocket:
             websocket_state = json.loads(websocket.recv(timeout=3))
+        after_reconnect = _request("/api/state")
         encoded = json.dumps(state, allow_nan=False)
         if any(secret and secret in encoded for secret in secrets):
             raise RuntimeError("A configured secret appeared in dashboard state")
@@ -143,6 +145,19 @@ def _web_mode(mode: str) -> dict[str, Any]:
             raise RuntimeError(f"Forbidden dashboard keys: {sorted(forbidden)}")
         if int(websocket_state.get("revision", -1)) < int(state.get("revision", -1)):
             raise RuntimeError("WebSocket state was older than the REST state")
+        auto = state.get("auto_advisory") or {}
+        if auto.get("enabled") is not False:
+            raise RuntimeError("Automatic advisory was not OFF during smoke testing")
+        required_spacing = {
+            "min_interval_minutes", "seconds_since_last_call",
+            "next_eligible_time", "seconds_until_eligible",
+        }
+        if not required_spacing <= set(auto):
+            raise RuntimeError("Automatic-advisory spacing state is incomplete")
+        calls_before = ((state.get("usage") or {}).get("summary") or {}).get("calls_today")
+        calls_after = ((after_reconnect.get("usage") or {}).get("summary") or {}).get("calls_today")
+        if calls_after != calls_before:
+            raise RuntimeError("Browser reconnect changed the advisory call count")
         addresses = _listener_addresses()
         if not addresses or set(addresses) != {HOST}:
             raise RuntimeError(f"Unexpected dashboard listener addresses: {addresses}")
@@ -164,6 +179,9 @@ def _web_mode(mode: str) -> dict[str, Any]:
             "last_advisory_present": bool(
                 (state.get("ai") or {}).get("last_advisory")
             ),
+            "auto_advisory_enabled": auto.get("enabled"),
+            "spacing_state_present": True,
+            "reconnect_triggered_advisory": False,
             "safe_payload": True,
         }
         _request("/api/exit", method="POST")

@@ -11,7 +11,7 @@ const sample = (revision: number, current: string, last: string): ApplicationSta
   validity: { eligible: false, status: "BLOCKED", reasons: [], valid_reasons: [] },
   news_gate: null,
   ai: { state: "BLOCKED", last_advisory: { timestamp: "", candidate_time: last, decision: "NO_TRADE", confidence: 80, usage: {} } },
-  auto_advisory: { enabled: false, state: "OFF", candidate_time: null, last_call_time: null, last_result: null, reason: null },
+  auto_advisory: { enabled: false, state: "OFF", candidate_time: null, last_call_time: null, last_result: null, reason: null, min_interval_minutes: 0, seconds_since_last_call: null, next_eligible_time: null, seconds_until_eligible: 0 },
   paper: null,
   paper_stats: {},
   paper_history: [],

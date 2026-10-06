@@ -12,6 +12,8 @@ from typing import Any
 
 from .ai_models import AdvisoryResult
 from .config import AIConfig
+from .economic_calendar import EconomicNewsGateResult
+from .models import MarketGateResult, XAUUSDMarketSnapshot
 from .timestamps import TimestampError, canonical_timestamp, parse_timestamp, seconds_between
 
 
@@ -25,6 +27,16 @@ class AttemptReservation:
     usage_id: int | None
     symbol: str
     completed_m1_time: str
+    last_auto_call_time: str | None = None
+    next_auto_call_time: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AutoSpacingStatus:
+    last_call_time: str | None
+    next_eligible_time: str | None
+    seconds_since_last_call: float | None
+    seconds_until_eligible: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -336,6 +348,53 @@ class SQLiteStateStore:
                     PRIMARY KEY (paper_id, checkpoint_minutes),
                     FOREIGN KEY (paper_id) REFERENCES paper_evaluations(id)
                 );
+
+                CREATE TABLE IF NOT EXISTS research_candidates (
+                    symbol TEXT NOT NULL,
+                    completed_m1_time TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    trade_server_time TEXT NOT NULL,
+                    bid REAL NOT NULL,
+                    ask REAL NOT NULL,
+                    spread_price REAL NOT NULL,
+                    spread_points REAL,
+                    direction_m1 TEXT NOT NULL,
+                    direction_m5 TEXT NOT NULL,
+                    directions_aligned INTEGER NOT NULL,
+                    m1_latest_range_points REAL,
+                    m1_average_range_points REAL,
+                    m5_latest_range_points REAL,
+                    m5_average_range_points REAL,
+                    m1_spike_ratio REAL,
+                    m5_spike_ratio REAL,
+                    spread_to_m1_range_ratio REAL,
+                    market_gate_eligible INTEGER NOT NULL,
+                    market_rejection_reasons_json TEXT NOT NULL,
+                    news_safe INTEGER NOT NULL,
+                    news_rejection_reasons_json TEXT NOT NULL,
+                    nearest_event_json TEXT,
+                    candidate_hash TEXT,
+                    disposition TEXT NOT NULL,
+                    disposition_reason TEXT,
+                    advisory_usage_id INTEGER,
+                    decision TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (symbol, completed_m1_time),
+                    FOREIGN KEY (advisory_usage_id) REFERENCES api_usage(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_research_candidates_captured
+                    ON research_candidates(captured_at);
+
+                CREATE TABLE IF NOT EXISTS auto_advisory_calls (
+                    usage_id INTEGER PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    completed_m1_time TEXT NOT NULL,
+                    reserved_at TEXT NOT NULL,
+                    called_at TEXT,
+                    FOREIGN KEY (usage_id) REFERENCES api_usage(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_auto_advisory_calls_called
+                    ON auto_advisory_calls(called_at);
                 """
             )
             # Serialize and atomically apply additive migrations. If the process
@@ -388,6 +447,8 @@ class SQLiteStateStore:
         input_hash: str,
         config: AIConfig,
         now: datetime | None = None,
+        automatic: bool = False,
+        min_interval_minutes: float = 0.0,
     ) -> AttemptReservation:
         normalized_symbol = symbol.upper()
         try:
@@ -422,6 +483,35 @@ class SQLiteStateStore:
                         normalized_symbol,
                         candle_time,
                     )
+
+                last_auto: str | None = None
+                next_auto: str | None = None
+                if automatic and min_interval_minutes > 0:
+                    last_row = connection.execute(
+                        """
+                        SELECT COALESCE(called_at, reserved_at) AS spacing_time
+                        FROM auto_advisory_calls
+                        ORDER BY COALESCE(called_at, reserved_at) DESC LIMIT 1
+                        """
+                    ).fetchone()
+                    if last_row is not None:
+                        last_time = parse_timestamp(str(last_row["spacing_time"]))
+                        if last_time.tzinfo is None or last_time.utcoffset() is None:
+                            connection.rollback()
+                            return AttemptReservation(
+                                False, "invalid_auto_advisory_timestamp", None,
+                                normalized_symbol, candle_time,
+                            )
+                        last_time = last_time.astimezone(timezone.utc)
+                        next_time = last_time + timedelta(minutes=min_interval_minutes)
+                        last_auto = last_time.isoformat()
+                        next_auto = next_time.isoformat()
+                        if timestamp < next_time:
+                            connection.rollback()
+                            return AttemptReservation(
+                                False, "rate_spacing_blocked", None,
+                                normalized_symbol, candle_time, last_auto, next_auto,
+                            )
 
                 daily = connection.execute(
                     """
@@ -488,13 +578,186 @@ class SQLiteStateStore:
                     ),
                 )
                 usage_id = int(cursor.lastrowid)
+                if automatic:
+                    connection.execute(
+                        """
+                        INSERT INTO auto_advisory_calls
+                            (usage_id, symbol, completed_m1_time, reserved_at, called_at)
+                        VALUES (?, ?, ?, ?, NULL)
+                        """,
+                        (usage_id, normalized_symbol, candle_time, reserved_at),
+                    )
                 connection.commit()
                 return AttemptReservation(
-                    True, None, usage_id, normalized_symbol, candle_time
+                    True, None, usage_id, normalized_symbol, candle_time,
+                    last_auto, next_auto,
                 )
             except Exception:
                 connection.rollback()
                 raise
+
+    def mark_auto_call_started(
+        self, usage_id: int, now: datetime | None = None
+    ) -> str:
+        """Mark the point immediately before the external automatic API call."""
+
+        called_at = _utc_now(now).isoformat()
+        with closing(self._connect()) as connection:
+            cursor = connection.execute(
+                """
+                UPDATE auto_advisory_calls SET called_at = ?
+                WHERE usage_id = ? AND called_at IS NULL
+                """,
+                (called_at, usage_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Automatic advisory reservation is missing or already started")
+        return called_at
+
+    def auto_spacing_status(
+        self,
+        min_interval_minutes: float,
+        now: datetime | None = None,
+    ) -> AutoSpacingStatus:
+        timestamp = _utc_now(now)
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT COALESCE(called_at, reserved_at) AS spacing_time
+                FROM auto_advisory_calls
+                ORDER BY COALESCE(called_at, reserved_at) DESC LIMIT 1
+                """
+            ).fetchone()
+        if row is None:
+            return AutoSpacingStatus(None, None, None, 0.0)
+        parsed = parse_timestamp(str(row["spacing_time"]))
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            raise ValueError("Persisted automatic advisory timestamp is not timezone-aware")
+        parsed = parsed.astimezone(timezone.utc)
+        next_time = parsed + timedelta(minutes=max(0.0, min_interval_minutes))
+        elapsed = (timestamp - parsed).total_seconds()
+        return AutoSpacingStatus(
+            parsed.isoformat(),
+            next_time.isoformat(),
+            max(0.0, elapsed),
+            max(0.0, (next_time - timestamp).total_seconds()),
+        )
+
+    def record_research_candidate(
+        self,
+        snapshot: XAUUSDMarketSnapshot,
+        market_gate: MarketGateResult,
+        news_gate: EconomicNewsGateResult,
+        *,
+        candidate_hash: str | None,
+        disposition: str,
+        reason: str | None = None,
+    ) -> bool:
+        """Insert one safe research row for a completed M1 candle."""
+
+        if not market_gate.completed_m1_time:
+            return False
+        candle_time = canonical_timestamp(market_gate.completed_m1_time)
+        symbol = snapshot.symbol.symbol.upper()
+        metrics = market_gate.metrics
+        nearest = (
+            json.dumps(news_gate.nearest_event.to_dict(), allow_nan=False, separators=(",", ":"))
+            if news_gate.nearest_event else None
+        )
+        values = (
+            symbol, candle_time, snapshot.captured_at_utc, snapshot.trade_server_time,
+            snapshot.symbol.bid, snapshot.symbol.ask, snapshot.metrics.spread_price,
+            metrics.spread_points, market_gate.direction_m1, market_gate.direction_m5,
+            int(market_gate.directions_aligned), metrics.m1_latest_completed_range_points,
+            metrics.m1_baseline_range_points, metrics.m5_latest_completed_range_points,
+            metrics.m5_baseline_range_points, metrics.m1_spike_ratio,
+            metrics.m5_spike_ratio, metrics.spread_to_m1_range_ratio,
+            int(market_gate.eligible_for_ai),
+            json.dumps(market_gate.rejection_reasons, separators=(",", ":")),
+            int(news_gate.safe_for_ai),
+            json.dumps(news_gate.rejection_reasons, separators=(",", ":")),
+            nearest, candidate_hash, disposition, reason,
+            datetime.now(timezone.utc).isoformat(),
+        )
+        with closing(self._connect()) as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO research_candidates (
+                    symbol, completed_m1_time, captured_at, trade_server_time,
+                    bid, ask, spread_price, spread_points, direction_m1, direction_m5,
+                    directions_aligned, m1_latest_range_points, m1_average_range_points,
+                    m5_latest_range_points, m5_average_range_points, m1_spike_ratio,
+                    m5_spike_ratio, spread_to_m1_range_ratio, market_gate_eligible,
+                    market_rejection_reasons_json, news_safe,
+                    news_rejection_reasons_json, nearest_event_json, candidate_hash,
+                    disposition, disposition_reason, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                values,
+            )
+            return cursor.rowcount == 1
+
+    def update_research_candidate(
+        self,
+        snapshot: XAUUSDMarketSnapshot,
+        market_gate: MarketGateResult,
+        news_gate: EconomicNewsGateResult,
+        *,
+        candidate_hash: str | None,
+        disposition: str,
+        reason: str | None = None,
+        advisory_usage_id: int | None = None,
+        decision: str | None = None,
+    ) -> None:
+        if not market_gate.completed_m1_time:
+            return
+        metrics = market_gate.metrics
+        nearest = (
+            json.dumps(news_gate.nearest_event.to_dict(), allow_nan=False, separators=(",", ":"))
+            if news_gate.nearest_event else None
+        )
+        with closing(self._connect()) as connection:
+            connection.execute(
+                """
+                UPDATE research_candidates SET
+                    captured_at=?, trade_server_time=?, bid=?, ask=?, spread_price=?,
+                    spread_points=?, direction_m1=?, direction_m5=?, directions_aligned=?,
+                    m1_latest_range_points=?, m1_average_range_points=?,
+                    m5_latest_range_points=?, m5_average_range_points=?,
+                    m1_spike_ratio=?, m5_spike_ratio=?, spread_to_m1_range_ratio=?,
+                    market_gate_eligible=?, market_rejection_reasons_json=?,
+                    news_safe=?, news_rejection_reasons_json=?, nearest_event_json=?,
+                    candidate_hash=COALESCE(?, candidate_hash), disposition=?,
+                    disposition_reason=?, advisory_usage_id=COALESCE(?, advisory_usage_id),
+                    decision=COALESCE(?, decision), updated_at=?
+                WHERE symbol=? AND completed_m1_time=?
+                """,
+                (
+                    snapshot.captured_at_utc, snapshot.trade_server_time,
+                    snapshot.symbol.bid, snapshot.symbol.ask, snapshot.metrics.spread_price,
+                    metrics.spread_points, market_gate.direction_m1, market_gate.direction_m5,
+                    int(market_gate.directions_aligned), metrics.m1_latest_completed_range_points,
+                    metrics.m1_baseline_range_points, metrics.m5_latest_completed_range_points,
+                    metrics.m5_baseline_range_points, metrics.m1_spike_ratio,
+                    metrics.m5_spike_ratio, metrics.spread_to_m1_range_ratio,
+                    int(market_gate.eligible_for_ai),
+                    json.dumps(market_gate.rejection_reasons, separators=(",", ":")),
+                    int(news_gate.safe_for_ai),
+                    json.dumps(news_gate.rejection_reasons, separators=(",", ":")),
+                    nearest, candidate_hash, disposition, reason, advisory_usage_id,
+                    decision, datetime.now(timezone.utc).isoformat(),
+                    snapshot.symbol.symbol.upper(),
+                    canonical_timestamp(market_gate.completed_m1_time),
+                ),
+            )
+
+    def research_candidate(self, symbol: str, completed_m1_time: str) -> dict[str, Any] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM research_candidates WHERE symbol=? AND completed_m1_time=?",
+                (symbol.upper(), canonical_timestamp(completed_m1_time)),
+            ).fetchone()
+            return dict(row) if row is not None else None
 
     def finish_ai_attempt(
         self,

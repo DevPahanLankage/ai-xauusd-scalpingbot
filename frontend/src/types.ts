@@ -78,6 +78,10 @@ export interface ApplicationState {
     last_call_time: string | null;
     last_result: string | null;
     reason: string | null;
+    min_interval_minutes: number;
+    seconds_since_last_call: number | null;
+    next_eligible_time: string | null;
+    seconds_until_eligible: number;
   };
   paper: null | Record<string, unknown> & {
     id: number;

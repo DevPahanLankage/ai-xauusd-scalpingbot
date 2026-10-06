@@ -45,7 +45,7 @@ class _Service:
         self.outcome = outcome or AIAdvisoryOutcome(False, "blocked", None, None, None)
         self.error = error
 
-    async def evaluate(self, *_: object) -> AIAdvisoryOutcome:
+    async def evaluate(self, *_: object, **__: object) -> AIAdvisoryOutcome:
         self.calls += 1
         if self.error:
             raise self.error

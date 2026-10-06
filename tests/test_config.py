@@ -16,7 +16,19 @@ from xauusd_bot.config import (
 class AutomaticAndPaperConfigurationTests(unittest.TestCase):
     def test_automatic_advisory_defaults_off(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
-            self.assertFalse(AutoAdvisoryConfig.from_environment().enabled)
+            config = AutoAdvisoryConfig.from_environment()
+            self.assertFalse(config.enabled)
+            self.assertEqual(config.min_interval_minutes, 0)
+
+    def test_automatic_advisory_spacing_is_environment_backed(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"XAUUSD_AUTO_ADVISORY_MIN_INTERVAL_MINUTES": "10"},
+            clear=True,
+        ):
+            self.assertEqual(
+                AutoAdvisoryConfig.from_environment().min_interval_minutes, 10
+            )
 
     def test_paper_horizons_and_checkpoints_are_environment_backed(self) -> None:
         with patch.dict(

@@ -25,6 +25,8 @@ refreshing the dashboard, and reconnecting its WebSocket make zero OpenAI reques
 The monitor can display `AI ELIGIBLE`. Automatic advisory is disabled by default and
 can be explicitly enabled with `XAUUSD_AUTO_ADVISORY_ENABLED=true`; it uses the same
 gates, atomic candidate reservation, budgets, and advisory service as `--ai`.
+Every completed M1 candidate seen by the monitor is recorded once for research,
+including deterministic and news rejections, without account identity or secrets.
 
 One windowed executable supports all main launch modes:
 
@@ -237,6 +239,8 @@ automatic evaluation per eligible completed M1 candle, configure:
 
 ```dotenv
 XAUUSD_AUTO_ADVISORY_ENABLED=true
+# Recommended for the next live research run; the application default remains 0.
+XAUUSD_AUTO_ADVISORY_MIN_INTERVAL_MINUTES=10
 XAUUSD_PAPER_ENTRY_EXPIRY_MINUTES=10
 XAUUSD_PAPER_MAX_TRADE_MINUTES=30
 XAUUSD_PAPER_CHECKPOINT_MINUTES=1,3,5,10,15,30
@@ -285,6 +289,8 @@ local timezone and is useful when analysis occurs after midnight. The report inc
 API usage, decision/confidence distributions, directional paper statistics, sampled
 NO_TRADE checkpoint movement, context groupings, transparent text frequencies,
 server-hour distribution, candidate-efficiency limitations, and a data-quality audit.
+New databases also report every deterministic candidate, gate/news/spacing
+dispositions, AI conversion, and separate candidate/call counts by MT5 server hour.
 Checkpoint excursions are explicitly labeled as sampled midpoint observations, not
 intraperiod tick highs/lows or hypothetical trade outcomes.
 
@@ -319,6 +325,11 @@ resolution is documented under Packaged configuration above. A unique
 `(symbol, completed_m1_time)` key prevents duplicate spend across threads and process
 restarts. Existing databases are migrated in place. `--usage` reports reported known
 spend separately from conservative budget-accounted spend.
+
+Automatic mode optionally applies a durable paid-call interval with
+`XAUUSD_AUTO_ADVISORY_MIN_INTERVAL_MINUTES`. Its default is `0` (legacy behavior).
+A spacing-deferred candle remains MarketGate-valid, is recorded as
+`RATE_SPACING_BLOCKED`, and is not reserved as an AI candidate.
 
 Default limits are 30 calls/day, $0.65 budget-accounted spend/day, and $5.00/week.
 Pricing is centralized in `AIConfig`: $2.00/1M ordinary input tokens, $0.10/1M cached

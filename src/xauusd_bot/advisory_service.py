@@ -52,6 +52,9 @@ class AIAdvisoryService:
         snapshot: XAUUSDMarketSnapshot,
         market_gate: MarketGateResult,
         news_gate: EconomicNewsGateResult,
+        *,
+        automatic: bool = False,
+        min_interval_minutes: float = 0.0,
     ) -> AIAdvisoryOutcome:
         if not market_gate.eligible_for_ai:
             return self._skipped("market_gate_rejected")
@@ -89,6 +92,8 @@ class AIAdvisoryService:
             completed_m1_time=market_gate.completed_m1_time,
             input_hash=input_hash,
             config=self._config,
+            automatic=automatic,
+            min_interval_minutes=min_interval_minutes,
         )
         if not reservation.reserved:
             return AIAdvisoryOutcome(
@@ -101,6 +106,9 @@ class AIAdvisoryService:
 
         call_started = time.monotonic()
         try:
+            if automatic:
+                assert reservation.usage_id is not None
+                store.mark_auto_call_started(reservation.usage_id)
             result = await asyncio.to_thread(advisor.evaluate, payload)
             if not isinstance(result, AdvisoryResult):
                 raise TypeError("Advisor returned an unexpected result type")

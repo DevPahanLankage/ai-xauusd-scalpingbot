@@ -293,9 +293,11 @@ def build_application_state(
     auto = auto_advisory or {
         "enabled": False, "state": "OFF", "candidate_time": None,
         "last_call_time": None, "last_result": None, "reason": None,
+        "min_interval_minutes": 0.0, "seconds_since_last_call": None,
+        "next_eligible_time": None, "seconds_until_eligible": 0.0,
     }
     if auto.get("enabled") and auto.get("state") in {
-        "ANALYZING", "BUY", "SELL", "NO_TRADE", "ERROR"
+        "ANALYZING", "BUY", "SELL", "NO_TRADE", "ERROR", "WAITING_SPACING"
     }:
         ai_state = str(auto["state"])
     paper_value = paper or {"latest": None, "history": [], "stats": {}}
@@ -405,6 +407,8 @@ def disconnected_state(*, mode: str, started_at: datetime, message: str, events:
         "auto_advisory": {
             "enabled": False, "state": "OFF", "candidate_time": None,
             "last_call_time": None, "last_result": None, "reason": "mt5_disconnected",
+            "min_interval_minutes": 0.0, "seconds_since_last_call": None,
+            "next_eligible_time": None, "seconds_until_eligible": 0.0,
         },
         "paper": None,
         "paper_stats": {},

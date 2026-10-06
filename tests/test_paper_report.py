@@ -6,6 +6,7 @@ import os
 import sqlite3
 import tempfile
 import unittest
+from dataclasses import replace
 from contextlib import redirect_stdout
 from datetime import date, datetime, timezone
 from io import StringIO
@@ -14,12 +15,16 @@ from unittest.mock import patch
 
 from xauusd_bot import cli
 from xauusd_bot.config import AIConfig
+from xauusd_bot.config import MarketGateConfig
+from xauusd_bot.market_gate import MarketGate
 from xauusd_bot.paper_report import (
     build_paper_report,
     packaged_state_path,
     paper_report_to_json,
 )
 from xauusd_bot.state_store import SQLiteStateStore
+from tests.test_advisory_flow import safe_news
+from tests.test_market_gate import _snapshot
 
 
 NOW = datetime(2026, 10, 6, 20, 0, tzinfo=timezone.utc)
@@ -263,6 +268,68 @@ class PaperReportTests(unittest.TestCase):
         settings.assert_not_called()
         ai.assert_not_called()
         mt5.assert_not_called()
+
+    def test_candidate_analytics_conversion_and_server_hours(self) -> None:
+        store = SQLiteStateStore(self.path)
+        snapshot = _snapshot()
+        base_gate = MarketGate(MarketGateConfig()).evaluate(snapshot)
+        news = safe_news()
+        rows = (
+            ("2026-10-06T09:01:00", "NOT_ELIGIBLE", False, True, None),
+            ("2026-10-06T09:02:00", "NEWS_BLOCKED", True, False, None),
+            ("2026-10-06T10:01:00", "RATE_SPACING_BLOCKED", True, True, None),
+            ("2026-10-06T10:02:00", "BUDGET_BLOCKED", True, True, None),
+            ("2026-10-06T11:01:00", "SENT_TO_AI", True, True, "BUY"),
+            ("2026-10-06T11:02:00", "SENT_TO_AI", True, True, "NO_TRADE"),
+        )
+        for index, (candidate, disposition, eligible, safe, decision) in enumerate(rows):
+            gate = replace(
+                base_gate,
+                completed_m1_time=candidate,
+                eligible_for_ai=eligible,
+                rejection_reasons=() if eligible else ("spread_too_wide",),
+            )
+            candidate_news = replace(
+                news,
+                safe_for_ai=safe,
+                rejection_reasons=() if safe else ("high_impact_news_blackout",),
+            )
+            current = replace(
+                snapshot,
+                captured_at_utc=f"2026-10-06T10:{index:02d}:00+00:00",
+                trade_server_time=candidate,
+            )
+            store.record_research_candidate(
+                current, gate, candidate_news, candidate_hash=f"candidate-{index}",
+                disposition=disposition,
+            )
+            if decision:
+                store.update_research_candidate(
+                    current, gate, candidate_news,
+                    candidate_hash=f"candidate-{index}", disposition=disposition,
+                    decision=decision,
+                )
+
+        report = self.report()
+        candidates = report["deterministic_candidates"]
+        self.assertEqual(candidates["total"], 6)
+        self.assertEqual(candidates["market_gate_eligible"], 5)
+        self.assertEqual(candidates["market_gate_rejected"], 1)
+        self.assertEqual(candidates["news_blocked"], 1)
+        self.assertEqual(candidates["spacing_blocked"], 1)
+        self.assertEqual(candidates["budget_blocked"], 1)
+        self.assertEqual(candidates["sent_to_ai"], 2)
+        conversion = report["ai_conversion"]
+        self.assertEqual(conversion["eligible_deterministic_candidates"], 4)
+        self.assertEqual(conversion["sent_to_gpt"], 2)
+        self.assertEqual(conversion["BUY"], 1)
+        self.assertEqual(conversion["NO_TRADE"], 1)
+        self.assertEqual(conversion["percentage_eligible_sent"], 0.5)
+        self.assertEqual(conversion["percentage_directional"], 0.5)
+        hours = report["time_distribution_server_hour"]
+        self.assertEqual(hours["09:00"]["candidates"], 2)
+        self.assertEqual(hours["11:00"]["candidates"], 2)
+        self.assertEqual(hours["12:00"]["calls"], 6)
 
 
 class PartialAndEmptyDatabaseTests(unittest.TestCase):

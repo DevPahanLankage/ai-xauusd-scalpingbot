@@ -25,6 +25,14 @@ def _value(value: Any, suffix: str = "") -> str:
     return f"{value}{suffix}"
 
 
+def _duration(value: Any) -> str:
+    if not isinstance(value, (int, float)):
+        return "—"
+    seconds = max(0, int(round(value)))
+    minutes, remainder = divmod(seconds, 60)
+    return f"{minutes}m {remainder}s" if minutes else f"{remainder}s"
+
+
 def _line(value: Any, style: str | None = None) -> Text:
     return Text(str(value), style=style, overflow="ellipsis", no_wrap=True)
 
@@ -165,6 +173,7 @@ def _full_dashboard(state: dict[str, Any], height: int) -> Group:
     validity = state["validity"]
     news = state["news_gate"]
     ai = state.get("ai") or {}
+    auto = state.get("auto_advisory") or {}
     last = ai.get("last_advisory")
     usage = state.get("usage") or {}
     paper_stats = state.get("paper_stats") or {}
@@ -410,7 +419,9 @@ def _full_dashboard(state: dict[str, Any], height: int) -> Group:
         "Mode / uptime",
         _line(
             f"{_value(system.get('mode'))} / "
-            f"{int(system.get('uptime_seconds', 0))}s"
+            f"{int(system.get('uptime_seconds', 0))}s | "
+            f"AI {_value(auto.get('min_interval_minutes'), 'm')} "
+            f"next {_duration(auto.get('seconds_until_eligible'))}"
         ),
     )
     system_table.add_row("Candidate", _line(_value(system.get("candidate_time"))))

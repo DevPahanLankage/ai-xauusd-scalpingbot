@@ -238,10 +238,16 @@ class AutoAdvisoryConfig:
     """Explicit opt-in for automatic advisory evaluation."""
 
     enabled: bool = False
+    min_interval_minutes: float = 0.0
 
     @classmethod
     def from_environment(cls) -> "AutoAdvisoryConfig":
-        return cls(enabled=_boolean("XAUUSD_AUTO_ADVISORY_ENABLED", False))
+        return cls(
+            enabled=_boolean("XAUUSD_AUTO_ADVISORY_ENABLED", False),
+            min_interval_minutes=_non_negative_float(
+                "XAUUSD_AUTO_ADVISORY_MIN_INTERVAL_MINUTES", 0.0
+            ),
+        )
 
 
 @dataclass(frozen=True, slots=True)

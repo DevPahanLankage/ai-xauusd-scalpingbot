@@ -7,6 +7,12 @@ const money = (value: unknown, digits = 2) => typeof value === "number" ? `$${va
 const number = (value: unknown, digits = 2) => typeof value === "number" ? value.toFixed(digits) : "—";
 const text = (value: unknown) => value === null || value === undefined || value === "" ? "—" : String(value);
 const shortTime = (value: unknown) => value ? new Date(String(value)).toLocaleTimeString() : "—";
+const duration = (value: unknown) => {
+  if (typeof value !== "number" || !Number.isFinite(value)) return "—";
+  const seconds = Math.max(0, Math.ceil(value));
+  const minutes = Math.floor(seconds / 60);
+  return minutes > 0 ? `${minutes}m ${seconds % 60}s` : `${seconds}s`;
+};
 
 function useLiveState() {
   const [state, setState] = useState<ApplicationState | null>(null);
@@ -215,7 +221,10 @@ function App() {
         </Panel>
         <Panel title="AUTO ADVISORY">
           <Row label="Enabled">{state.auto_advisory.enabled ? "YES" : "NO"}</Row>
-          <Row label="State">{text(state.auto_advisory.state)}</Row>
+          <Row label="State">{state.auto_advisory.state === "WAITING_SPACING" ? "WAITING — AI SPACING" : text(state.auto_advisory.state)}</Row>
+          <Row label="AI Spacing">{number(state.auto_advisory.min_interval_minutes, 1)} min</Row>
+          <Row label="Since paid call">{duration(state.auto_advisory.seconds_since_last_call)}</Row>
+          <Row label="Next AI eligible">{duration(state.auto_advisory.seconds_until_eligible)}</Row>
           <Row label="Candidate">{text(state.auto_advisory.candidate_time)}</Row>
           <Row label="Last call">{text(state.auto_advisory.last_call_time)}</Row>
           <Row label="Last result">{text(state.auto_advisory.last_result)}</Row>

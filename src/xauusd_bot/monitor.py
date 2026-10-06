@@ -79,13 +79,25 @@ class MonitoringService:
         self.tracker = MeaningfulEventTracker(self.events)
         self._state_store: SQLiteStateStore | None = None
         self._paper_tracker: PaperPerformanceTracker | None = None
+        try:
+            self._state_store = SQLiteStateStore(
+                settings.ai.state_db_path,
+                legacy_reserve_usd=settings.ai.budget_reserve_per_call_usd,
+            )
+            self._paper_tracker = PaperPerformanceTracker(
+                self._state_store, settings.paper
+            )
+        except Exception as exc:
+            LOGGER.warning("Persistent research state unavailable (%s)", type(exc).__name__)
         advisory_service = AIAdvisoryService(
             settings.ai,
+            state_store=self._state_store,
             paper_config=settings.paper,
         )
         self.auto_advisory = AutomaticAdvisoryCoordinator(
             settings.auto_advisory,
             advisory_service,
+            state_store=self._state_store,
         )
         self.hub = StateHub(
             disconnected_state(
@@ -188,16 +200,20 @@ class MonitoringService:
 
     async def _publish(self, snapshot: Any, news: Any) -> None:
         gate = MarketGate(self.settings.market_gate).evaluate(snapshot)
+        preview = AIPreviewService(self.settings.ai).evaluate(snapshot, gate, news)
         paper = self._paper_state(snapshot)
-        await self._publish_state(snapshot, gate, news, paper)
+        await self._publish_state(snapshot, gate, news, paper, preview=preview)
 
         async def publish_analyzing() -> None:
-            await self._publish_state(snapshot, gate, news, self._read_paper_state())
+            await self._publish_state(
+                snapshot, gate, news, self._read_paper_state(), preview=preview
+            )
 
         outcome = await self.auto_advisory.maybe_evaluate(
             snapshot,
             gate,
             news,
+            candidate_hash=preview.input_hash,
             on_analyzing=publish_analyzing,
         )
         if outcome is not None:
@@ -234,8 +250,10 @@ class MonitoringService:
         gate: Any,
         news: Any,
         paper: dict[str, Any],
+        *,
+        preview: Any | None = None,
     ) -> None:
-        preview = AIPreviewService(self.settings.ai).evaluate(snapshot, gate, news)
+        preview = preview or AIPreviewService(self.settings.ai).evaluate(snapshot, gate, news)
         try:
             last = SQLiteStateStore.last_advisory_read_only(
                 self.settings.ai.state_db_path
