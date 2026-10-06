@@ -266,6 +266,28 @@ Display local usage without contacting MT5 or OpenAI:
 .venv\Scripts\python -m xauusd_bot --usage
 ```
 
+Generate a strictly read-only advisory and paper analytics report. The report opens
+SQLite with `mode=ro`, performs no migrations or reservations, and never initializes
+MT5 or OpenAI:
+
+```powershell
+# Source/development state
+.venv\Scripts\python -m xauusd_bot --paper-report
+.venv\Scripts\python -m xauusd_bot --paper-report --today --json
+
+# Packaged EXE state under %LOCALAPPDATA%\XAUUSD-AI
+.venv\Scripts\python -m xauusd_bot --paper-report --packaged-state --today
+.venv\Scripts\python -m xauusd_bot --paper-report --packaged-state --date 2026-10-06
+```
+
+Every report prints the exact database path and period. `--date` uses the machine's
+local timezone and is useful when analysis occurs after midnight. The report includes
+API usage, decision/confidence distributions, directional paper statistics, sampled
+NO_TRADE checkpoint movement, context groupings, transparent text frequencies,
+server-hour distribution, candidate-efficiency limitations, and a data-quality audit.
+Checkpoint excursions are explicitly labeled as sampled midpoint observations, not
+intraperiod tick highs/lows or hypothetical trade outcomes.
+
 Tests:
 
 ```powershell

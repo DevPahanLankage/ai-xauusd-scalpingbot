@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from datetime import date
 
 from dotenv import load_dotenv
 
@@ -21,6 +22,13 @@ from .output import (
     preview_to_json,
     to_human,
     to_json,
+)
+from .paper_report import (
+    PaperReportError,
+    build_paper_report,
+    packaged_state_path,
+    paper_report_to_human,
+    paper_report_to_json,
 )
 from .preview import AIPreviewService
 from .state_store import SQLiteStateStore
@@ -49,6 +57,26 @@ def _parser() -> argparse.ArgumentParser:
         "--ai-preview",
         action="store_true",
         help="Inspect the exact eligible AI payload without OpenAI or state writes",
+    )
+    mode.add_argument(
+        "--paper-report",
+        action="store_true",
+        help="Analyze persisted advisory/paper data using read-only SQLite",
+    )
+    parser.add_argument(
+        "--today",
+        action="store_true",
+        help="Limit --paper-report to the current local calendar day",
+    )
+    parser.add_argument(
+        "--packaged-state",
+        action="store_true",
+        help="Use the packaged %LOCALAPPDATA%/XAUUSD-AI state location",
+    )
+    parser.add_argument(
+        "--date",
+        type=date.fromisoformat,
+        help="Limit --paper-report to one local date (YYYY-MM-DD)",
     )
     return parser
 
@@ -126,9 +154,43 @@ def _print_usage(config: AIConfig, json_output: bool) -> None:
     )
 
 
+def _print_paper_report(
+    config: AIConfig,
+    *,
+    json_output: bool,
+    today: bool,
+    report_date: date | None,
+    packaged: bool,
+) -> None:
+    path = packaged_state_path(config) if packaged else config.state_db_path.resolve()
+    report = build_paper_report(path, today=today, report_date=report_date)
+    print(paper_report_to_json(report) if json_output else paper_report_to_human(report))
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
     load_dotenv()
+    if (args.today or args.date or args.packaged_state) and not args.paper_report:
+        print("Configuration error: --today, --date, and --packaged-state require --paper-report", file=sys.stderr)
+        raise SystemExit(2)
+    if args.today and args.date:
+        print("Configuration error: --today and --date are mutually exclusive", file=sys.stderr)
+        raise SystemExit(2)
+    if args.paper_report:
+        try:
+            ai_config = AIConfig.from_environment()
+            configure_logging("INFO", secrets=(ai_config.api_key or "",))
+            _print_paper_report(
+                ai_config,
+                json_output=args.json,
+                today=args.today,
+                report_date=args.date,
+                packaged=args.packaged_state,
+            )
+        except (ConfigurationError, PaperReportError) as exc:
+            print(f"Paper report error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        return
     if args.usage:
         try:
             ai_config = AIConfig.from_environment()
