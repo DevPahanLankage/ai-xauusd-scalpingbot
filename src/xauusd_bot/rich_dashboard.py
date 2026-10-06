@@ -92,6 +92,7 @@ def _header(state: dict[str, Any]) -> Panel:
     system = state["system"]
     connected = system["mt5_connected"]
     ai = state.get("ai") or {}
+    auto = state.get("auto_advisory") or {}
     header = Text.assemble(
         ("XAUUSD AI ENGINE", "bold gold1"),
         "   ADVISORY ONLY   ",
@@ -101,6 +102,8 @@ def _header(state: dict[str, Any]) -> Panel:
         ),
         "   ",
         (str(ai.get("state", "BLOCKED")), "bold cyan"),
+        "   ",
+        (f"AUTO {auto.get('state', 'OFF')}", "bold yellow" if auto.get("enabled") else "dim"),
     )
     return Panel(header, border_style="gold1", padding=(0, 1))
 
@@ -164,9 +167,11 @@ def _full_dashboard(state: dict[str, Any], height: int) -> Group:
     ai = state.get("ai") or {}
     last = ai.get("last_advisory")
     usage = state.get("usage") or {}
+    paper_stats = state.get("paper_stats") or {}
     summary = usage.get("summary") or {}
     budget = usage.get("budget") or {}
     account = state["account"]
+    paper = state.get("paper") or {}
     system = state["system"]
 
     market_table = _table()
@@ -296,11 +301,12 @@ def _full_dashboard(state: dict[str, Any], height: int) -> Group:
         _line(f"{account['free_margin']:.2f} {account['currency']}"),
     )
     account_table.add_row(
-        "XAUUSD pos",
+        "Pos / paper",
         _line(
-            f"{account['xauusd_position_count']} OPEN"
+            (f"{account['xauusd_position_count']} OPEN"
             if account["xauusd_position_exists"]
-            else "NONE"
+            else "NONE")
+            + f" / {paper.get('status', 'NONE')}"
         ),
     )
 
@@ -387,7 +393,9 @@ def _full_dashboard(state: dict[str, Any], height: int) -> Group:
         "Last cost / sec",
         _line(
             f"{'—' if last_cost is None else f'${float(last_cost):.6f}'} / "
-            f"{'—' if latency is None else f'{float(latency) / 1000:.2f}'}"
+            f"{'—' if latency is None else f'{float(latency) / 1000:.2f}'} | "
+            f"paper W/L {paper_stats.get('wins', 0)}/{paper_stats.get('losses', 0)} "
+            f"R {_value(paper_stats.get('cumulative_r'))}"
         ),
     )
 
@@ -448,6 +456,8 @@ def _compact_dashboard(state: dict[str, Any], height: int) -> Group:
     validity = state["validity"]
     news = state.get("news_gate") or {}
     ai = state.get("ai") or {}
+    auto = state.get("auto_advisory") or {}
+    paper = state.get("paper") or {}
     last = ai.get("last_advisory") or {}
 
     summary = _table(label_width=15)
@@ -455,7 +465,7 @@ def _compact_dashboard(state: dict[str, Any], height: int) -> Group:
         "MT5 / AI",
         _line(
             f"{'CONNECTED' if state['system']['mt5_connected'] else 'DISCONNECTED'} / "
-            f"{ai.get('state', 'BLOCKED')}"
+            f"{ai.get('state', 'BLOCKED')} / AUTO {auto.get('state', 'OFF')}"
         ),
     )
     summary.add_row(
@@ -493,6 +503,10 @@ def _compact_dashboard(state: dict[str, Any], height: int) -> Group:
         ),
     )
     summary.add_row(
+        "Paper",
+        _line(f"{paper.get('decision', 'None')} / {paper.get('status', 'NONE')} / {_value(paper.get('final_r'))}R"),
+    )
+    summary.add_row(
         "Entry / SL / TP / RR",
         _line(
             f"{_value(last.get('entry_price'))} / {_value(last.get('stop_loss'))} / "
@@ -518,12 +532,14 @@ def _minimal_dashboard(state: dict[str, Any], height: int) -> Group:
     validity = state["validity"]
     news = state.get("news_gate") or {}
     ai = state.get("ai") or {}
+    auto = state.get("auto_advisory") or {}
+    paper = state.get("paper") or {}
     last = ai.get("last_advisory") or {}
     reasons = [item["message"] for item in validity.get("reasons", [])]
     lines = [
         _line(
             f"XAUUSD AI | MT5 {'UP' if state['system']['mt5_connected'] else 'DOWN'} | "
-            f"AI {ai.get('state', 'BLOCKED')} | eligible {validity['eligible']}",
+            f"AI {ai.get('state', 'BLOCKED')} | AUTO {auto.get('state', 'OFF')} | eligible {validity['eligible']}",
             "bold gold1",
         ),
         _line(
@@ -541,6 +557,7 @@ def _minimal_dashboard(state: dict[str, Any], height: int) -> Group:
             f"confidence {_value(last.get('confidence'), '%')} | "
             f"RR {_value(last.get('risk_reward_ratio'))}"
         ),
+        _line(f"Paper: {paper.get('decision', 'None')} / {paper.get('status', 'NONE')} / {_value(paper.get('final_r'))}R"),
         _line("Terminal too small — enlarge for full diagnostics", "bold yellow"),
         _line("[WAITING] Monitoring XAUUSD…  Ctrl+C to exit", "dim"),
     ]

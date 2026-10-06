@@ -71,6 +71,40 @@ export interface ApplicationState {
       usage: Record<string, number | null>;
     };
   };
+  auto_advisory: {
+    enabled: boolean;
+    state: string;
+    candidate_time: string | null;
+    last_call_time: string | null;
+    last_result: string | null;
+    reason: string | null;
+  };
+  paper: null | Record<string, unknown> & {
+    id: number;
+    decision: string;
+    confidence: number;
+    status: string;
+    fill_price: number | null;
+    stop_loss: number | null;
+    take_profit: number | null;
+    final_r: number | null;
+    mfe_r: number | null;
+    mae_r: number | null;
+  };
+  paper_stats: Record<string, unknown> & {
+    pending?: number;
+    open?: number;
+    completed?: number;
+    expired?: number;
+    ambiguous?: number;
+    wins?: number;
+    losses?: number;
+    win_rate?: number | null;
+    average_r?: number | null;
+    cumulative_r?: number;
+    profit_factor?: number | null;
+  };
+  paper_history: Array<Record<string, unknown>>;
   usage: null | {
     summary: null | Record<string, number>;
     budget: null | Record<string, number | boolean | string[]>;

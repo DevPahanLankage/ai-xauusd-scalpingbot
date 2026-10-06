@@ -112,7 +112,13 @@ function CandleChart({ state }: { state: ApplicationState }) {
       add(advisory.stop_loss, "SL", "#ef5f64");
       add(advisory.take_profit, "TP", "#32c48d");
     }
-  }, [state.market?.bid, state.market?.ask, state.ai.last_advisory]);
+    const paper = state.paper;
+    if (paper && paper.decision !== "NO_TRADE") {
+      add(paper.fill_price, "PAPER FILL", "#9b7dff", LineStyle.Dashed);
+      add(paper.stop_loss, "PAPER SL", "#ef5f64", LineStyle.Dotted);
+      add(paper.take_profit, "PAPER TP", "#32c48d", LineStyle.Dotted);
+    }
+  }, [state.market?.bid, state.market?.ask, state.ai.last_advisory, state.paper]);
   return <Panel title="PRICE STRUCTURE" className="chart-panel"><div className="chart-tools"><button className={timeframe === "m1" ? "active" : ""} onClick={() => setTimeframe("m1")}>M1</button><button className={timeframe === "m5" ? "active" : ""} onClick={() => setTimeframe("m5")}>M5</button></div><div ref={container} className="chart" /></Panel>;
 }
 
@@ -130,6 +136,8 @@ function App() {
   const last = state.ai.last_advisory;
   const summary = state.usage?.summary;
   const budget = state.usage?.budget;
+  const paper = state.paper;
+  const paperStats = state.paper_stats;
   const weeklySpend = Number(summary?.budget_accounted_spend_this_week_usd ?? 0);
   const weeklyCap = Number(budget?.weekly_spend_cap_usd ?? 5);
   const budgetPct = Math.min(100, weeklyCap > 0 ? (weeklySpend / weeklyCap) * 100 : 0);
@@ -140,7 +148,7 @@ function App() {
   return <main>
     <header className="topbar">
       <div><span className="symbol">XAUUSD</span><span className="advisory">ADVISORY ONLY</span></div>
-      <div className="top-status"><span className={state.system.mt5_connected ? "green" : "red"}>● MT5 {state.system.mt5_connected ? "CONNECTED" : "DISCONNECTED"}</span><span className={connected ? "green" : "amber"}>● LIVE {connected ? "CONNECTED" : "RECONNECTING"}</span><span className="ai-state">AI {state.ai.state}</span><span>{text(state.system.trade_server_time)}</span><button className="exit" onClick={exit}>Exit Application</button></div>
+      <div className="top-status"><span className={state.system.mt5_connected ? "green" : "red"}>● MT5 {state.system.mt5_connected ? "CONNECTED" : "DISCONNECTED"}</span><span className={connected ? "green" : "amber"}>● LIVE {connected ? "CONNECTED" : "RECONNECTING"}</span><span className="ai-state">AI {state.ai.state}</span><span className={state.auto_advisory.enabled ? "amber" : "muted"}>AUTO {state.auto_advisory.state}</span><span>{text(state.system.trade_server_time)}</span><button className="exit" onClick={exit}>Exit Application</button></div>
     </header>
 
     {!market || !gate ? <Panel title="ENGINE STATUS" className="blocked"><h3>MT5 DISCONNECTED</h3><p>{state.validity.reasons[0]?.message}</p><p>The application will reconnect automatically.</p></Panel> : <>
@@ -204,6 +212,34 @@ function App() {
           <Row label="Daily call / spend limits">{text(budget?.max_calls_per_day)} / {money(budget?.daily_spend_cap_usd)}</Row>
           <Row label="Weekly spend limit">{money(budget?.weekly_spend_cap_usd)}</Row>
           <div className="progress"><i style={{ width: `${budgetPct}%` }} /></div>
+        </Panel>
+        <Panel title="AUTO ADVISORY">
+          <Row label="Enabled">{state.auto_advisory.enabled ? "YES" : "NO"}</Row>
+          <Row label="State">{text(state.auto_advisory.state)}</Row>
+          <Row label="Candidate">{text(state.auto_advisory.candidate_time)}</Row>
+          <Row label="Last call">{text(state.auto_advisory.last_call_time)}</Row>
+          <Row label="Last result">{text(state.auto_advisory.last_result)}</Row>
+          <Row label="Reason">{text(state.auto_advisory.reason)}</Row>
+        </Panel>
+        <Panel title="PAPER OBSERVATION">
+          {!paper ? <p className="muted">No paper advisory is being tracked.</p> : <>
+            <Row label="Decision / status">{paper.decision} / {paper.status}</Row>
+            <Row label="Confidence">{paper.confidence}%</Row>
+            <Row label="Proposed entry">{text(paper.entry_price ?? paper.entry_zone_low)}</Row>
+            <Row label="Fill">{text(paper.fill_price)}</Row>
+            <Row label="Stop / target">{text(paper.stop_loss)} / {text(paper.take_profit)}</Row>
+            <Row label="MFE / MAE">{number(paper.mfe_r)}R / {number(paper.mae_r)}R</Row>
+            <Row label="Final">{number(paper.final_r)}R</Row>
+          </>}
+        </Panel>
+        <Panel title="PAPER PERFORMANCE">
+          <Row label="Pending / open">{text(paperStats.pending)} / {text(paperStats.open)}</Row>
+          <Row label="Completed / expired">{text(paperStats.completed)} / {text(paperStats.expired)}</Row>
+          <Row label="Wins / losses">{text(paperStats.wins)} / {text(paperStats.losses)}</Row>
+          <Row label="Win rate">{typeof paperStats.win_rate === "number" ? `${(paperStats.win_rate * 100).toFixed(1)}%` : "—"}</Row>
+          <Row label="Average / cumulative R">{number(paperStats.average_r)} / {number(paperStats.cumulative_r)}</Row>
+          <Row label="Profit factor">{number(paperStats.profit_factor)}</Row>
+          <div className="paper-history"><small>RECENT PAPER HISTORY</small>{state.paper_history.slice(0, 5).map((item, index) => <div key={`${text(item.id)}-${index}`}><span>{text(item.decision)} · {text(item.status)}</span><b>{number(item.final_r)}R</b></div>)}</div>
         </Panel>
         <Panel title="ACCOUNT">
           <Row label="Balance">{money(state.account?.balance)} {state.account?.currency}</Row><Row label="Equity">{money(state.account?.equity)} {state.account?.currency}</Row><Row label="Free margin">{money(state.account?.free_margin)} {state.account?.currency}</Row><Row label="XAUUSD position">{state.account?.xauusd_position_exists ? `${state.account.xauusd_position_count} OPEN` : "NONE"}</Row>

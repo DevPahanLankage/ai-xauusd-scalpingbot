@@ -22,8 +22,9 @@ MT5 Terminal MCP -> existing collector / gates / preview
 The dashboard does not contain alternate gate or advisory logic. React displays
 backend truth and never talks to MT5 or OpenAI. Opening the executable, opening or
 refreshing the dashboard, and reconnecting its WebSocket make zero OpenAI requests.
-The monitor can display `AI ELIGIBLE`, but an advisory remains available only through
-the existing explicit `--ai` developer command documented below.
+The monitor can display `AI ELIGIBLE`. Automatic advisory is disabled by default and
+can be explicitly enabled with `XAUUSD_AUTO_ADVISORY_ENABLED=true`; it uses the same
+gates, atomic candidate reservation, budgets, and advisory service as `--ai`.
 
 One windowed executable supports all main launch modes:
 
@@ -56,6 +57,8 @@ The browser provides a dark trading-terminal layout, M1/M5 candlestick selector,
 bid/ask lines, and persisted advisory entry/zone/SL/TP levels when they exist.
 `NO_TRADE` never creates chart levels. Current candidate identity and the persisted
 last advisory are labeled separately to prevent stale decisions from appearing current.
+The same state displays automatic-advisory status and durable paper observations.
+Browser refreshes and WebSocket reconnects only consume state and never trigger AI.
 
 ### Run the desktop app from source
 
@@ -182,6 +185,17 @@ M1/M5 history, candidate identity, finite JSON values, both gate decisions, and
 forbidden account/secret fields. Recommendations detached from current price by more
 than the configured recent-volatility multiple are converted to `NO_TRADE`.
 
+Paper tracking is observation-only. A recommendation is not considered filled merely
+because it was emitted. BUY entry checks use ask and BUY exits use bid; SELL entry
+checks use bid and SELL exits use ask. Entry expiry defaults to 10 minutes and an open
+paper trade expires after 30 minutes. Ordered ticks determine fills and exits. If only
+unordered candle evidence can show both stop and target in one candle, the outcome is
+`AMBIGUOUS`, never a manufactured win. `NO_TRADE` creates checkpoints only and is
+excluded from trade win/loss statistics. Paper state, checkpoints, gate/news context,
+MFE/MAE, R outcomes, and aggregates persist in the same ignored SQLite database.
+An observation gap longer than the configured 90-second default fails closed instead
+of inferring what happened while tick ordering was unavailable.
+
 ## Setup
 
 Python 3.10 or newer is required.
@@ -210,13 +224,27 @@ JSON output:
 ```
 
 Both commands above are free/read-only and never initialize or call OpenAI. Explicit
-advisory mode is the only mode that may make one API request after all gates, budget
+advisory mode may make one API request after all gates, budget
 checks, and duplicate protection pass:
 
 ```powershell
 .venv\Scripts\python -m xauusd_bot --ai
 .venv\Scripts\python -m xauusd_bot --ai --json
 ```
+
+The desktop remains zero-call by default. To deliberately opt into at most one
+automatic evaluation per eligible completed M1 candle, configure:
+
+```dotenv
+XAUUSD_AUTO_ADVISORY_ENABLED=true
+XAUUSD_PAPER_ENTRY_EXPIRY_MINUTES=10
+XAUUSD_PAPER_MAX_TRADE_MINUTES=30
+XAUUSD_PAPER_CHECKPOINT_MINUTES=1,3,5,10,15,30
+XAUUSD_PAPER_MAX_OBSERVATION_GAP_SECONDS=90
+```
+
+Disabling automatic mode does not delete paper history; ongoing observations can
+continue from persisted state using new read-only market ticks.
 
 Inspect first-call readiness without initializing OpenAI, reserving a candle, charging
 budget, or writing SQLite state:
@@ -277,7 +305,8 @@ tokens are included in output-token billing and are not charged twice. Successfu
 responses use actual SDK-reported usage. Failed attempts with unknown usage retain
 null token/cost fields, retain their budget reserve, and keep the candidate consumed.
 
-See `.env.example` for every supported `XAUUSD_NEWS_*`, `OPENAI_*`, and state-path
+See `.env.example` for every supported `XAUUSD_NEWS_*`, `XAUUSD_AUTO_*`,
+`XAUUSD_PAPER_*`, `OPENAI_*`, and state-path
 override.
 
 ## Troubleshooting
@@ -316,6 +345,6 @@ npm audit
 
 ## Planned stages
 
-This release remains advisory-only. Future stages, each requiring deliberate review,
-are paper outcome tracking, strategy evaluation, demo execution, and only eventually
-live execution. None of those execution stages is implemented here.
+This release remains advisory-only and includes paper outcome tracking. Future stages,
+each requiring deliberate review, are strategy evaluation, demo execution, and only
+eventually live execution. No execution stage is implemented here.

@@ -2,16 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
 from .advisor import OpenAIAdvisor
 from .ai_models import AdvisoryResult, safe_no_trade
-from .config import AIConfig
+from .config import AIConfig, PaperConfig
 from .economic_calendar import EconomicNewsGateResult
 from .models import MarketGateResult, XAUUSDMarketSnapshot
 from .payload import build_validated_ai_payload, payload_hash
+from .paper import PaperPerformanceTracker
 from .state_store import AttemptReservation, SQLiteStateStore
+from .timestamps import parse_timestamp
 
 
 LOGGER = logging.getLogger(__name__)
@@ -24,6 +28,7 @@ class AIAdvisoryOutcome:
     input_hash: str | None
     reservation: AttemptReservation | None
     result: AdvisoryResult | None
+    paper_id: int | None = None
 
 
 class AIAdvisoryService:
@@ -35,10 +40,12 @@ class AIAdvisoryService:
         *,
         state_store: SQLiteStateStore | None = None,
         advisor: Any | None = None,
+        paper_config: PaperConfig | None = None,
     ) -> None:
         self._config = config
         self._state_store = state_store
         self._advisor = advisor
+        self._paper_config = paper_config or PaperConfig()
 
     async def evaluate(
         self,
@@ -92,6 +99,7 @@ class AIAdvisoryService:
                 result=None,
             )
 
+        call_started = time.monotonic()
         try:
             result = await asyncio.to_thread(advisor.evaluate, payload)
             if not isinstance(result, AdvisoryResult):
@@ -105,7 +113,24 @@ class AIAdvisoryService:
                 latency_ms=0.0,
             )
             LOGGER.warning("AI advisor failed closed (%s)", type(exc).__name__)
+        call_elapsed = max(0.0, time.monotonic() - call_started)
         store.finish_ai_attempt(reservation, result)
+        paper_id = None
+        if result.status == "success":
+            try:
+                paper_id = PaperPerformanceTracker(store, self._paper_config).register(
+                    reservation=reservation,
+                    result=result,
+                    snapshot=snapshot,
+                    market_gate=market_gate,
+                    news_gate=news_gate,
+                    tracking_start_market_time=(
+                        parse_timestamp(snapshot.trade_server_time)
+                        + timedelta(seconds=call_elapsed)
+                    ).isoformat(),
+                ).paper_id
+            except Exception as exc:
+                LOGGER.warning("Paper advisory registration failed (%s)", type(exc).__name__)
         decision = result.decision
         LOGGER.info(
             "AI advisory candidate=%s input_hash=%s model=%s effort=%s "
@@ -138,6 +163,7 @@ class AIAdvisoryService:
             input_hash=input_hash,
             reservation=reservation,
             result=result,
+            paper_id=paper_id,
         )
 
     @staticmethod
@@ -148,4 +174,5 @@ class AIAdvisoryService:
             input_hash=None,
             reservation=None,
             result=None,
+            paper_id=None,
         )

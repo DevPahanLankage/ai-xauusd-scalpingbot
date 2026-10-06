@@ -12,7 +12,7 @@ from typing import Any
 
 from .ai_models import AdvisoryResult
 from .config import AIConfig
-from .timestamps import TimestampError, canonical_timestamp
+from .timestamps import TimestampError, canonical_timestamp, parse_timestamp, seconds_between
 
 
 LEGACY_MIGRATION_RESERVE_USD = 0.05
@@ -99,6 +99,82 @@ def evaluate_budget(summary: UsageSummary, config: AIConfig) -> BudgetStatus:
         weekly_spend_cap_usd=config.weekly_spend_cap_usd,
         max_calls_per_day=config.max_calls_per_day,
     )
+
+
+def _paper_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    decisions = {name: sum(row["decision"] == name for row in rows) for name in ("BUY", "SELL", "NO_TRADE")}
+    status_counts: dict[str, int] = {}
+    for row in rows:
+        status = str(row["status"])
+        status_counts[status] = status_counts.get(status, 0) + 1
+    completed = [
+        row for row in rows
+        if row["decision"] in {"BUY", "SELL"}
+        and row["status"] in {"TP_HIT", "SL_HIT", "EXPIRED_OPEN"}
+        and row["final_r"] is not None
+    ]
+    returns = [float(row["final_r"]) for row in completed]
+    wins = [value for value in returns if value > 0]
+    losses = [value for value in returns if value < 0]
+    gross_profit = sum(wins)
+    gross_loss = abs(sum(losses))
+    by_side: dict[str, dict[str, Any]] = {}
+    for side in ("BUY", "SELL"):
+        side_rows = [row for row in completed if row["decision"] == side]
+        side_r = [float(row["final_r"]) for row in side_rows]
+        by_side[side] = {
+            "completed": len(side_r),
+            "wins": sum(value > 0 for value in side_r),
+            "average_r": sum(side_r) / len(side_r) if side_r else None,
+        }
+    confidence: dict[str, dict[str, Any]] = {}
+    for label, lower, upper in (("0-59", 0, 59), ("60-79", 60, 79), ("80-100", 80, 100)):
+        bucket = [row for row in completed if lower <= int(row["confidence"]) <= upper]
+        bucket_r = [float(row["final_r"]) for row in bucket]
+        confidence[label] = {
+            "completed": len(bucket_r),
+            "wins": sum(value > 0 for value in bucket_r),
+            "average_r": sum(bucket_r) / len(bucket_r) if bucket_r else None,
+        }
+    def average(column: str) -> float | None:
+        values = [float(row[column]) for row in completed if row[column] is not None]
+        return sum(values) / len(values) if values else None
+    holding_seconds: list[float] = []
+    for row in completed:
+        if row.get("fill_at") and row.get("close_at"):
+            try:
+                holding_seconds.append(
+                    seconds_between(
+                        parse_timestamp(str(row["close_at"])),
+                        parse_timestamp(str(row["fill_at"])),
+                    )
+                )
+            except TimestampError:
+                pass
+    return {
+        "decision_counts": decisions,
+        "status_counts": status_counts,
+        "pending": status_counts.get("PENDING_ENTRY", 0),
+        "open": status_counts.get("OPEN", 0),
+        "completed": len(completed),
+        "expired": status_counts.get("EXPIRED_UNFILLED", 0) + status_counts.get("EXPIRED_OPEN", 0),
+        "ambiguous": status_counts.get("AMBIGUOUS", 0),
+        "wins": len(wins),
+        "losses": len(losses),
+        "win_rate": len(wins) / len(completed) if completed else None,
+        "average_r": sum(returns) / len(returns) if returns else None,
+        "cumulative_r": sum(returns),
+        "average_win_r": sum(wins) / len(wins) if wins else None,
+        "average_loss_r": sum(losses) / len(losses) if losses else None,
+        "profit_factor": gross_profit / gross_loss if gross_loss else None,
+        "average_mfe_r": average("mfe_r"),
+        "average_mae_r": average("mae_r"),
+        "average_holding_seconds": (
+            sum(holding_seconds) / len(holding_seconds) if holding_seconds else None
+        ),
+        "side_performance": by_side,
+        "confidence_buckets": confidence,
+    }
 
 
 def _summary_from_connection(
@@ -215,6 +291,51 @@ class SQLiteStateStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_api_usage_timestamp
                     ON api_usage(timestamp);
+
+                CREATE TABLE IF NOT EXISTS paper_evaluations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    advisory_usage_id INTEGER NOT NULL UNIQUE,
+                    symbol TEXT NOT NULL,
+                    candidate_time TEXT NOT NULL,
+                    advisory_completed_at TEXT NOT NULL,
+                    tracking_start_market_time TEXT NOT NULL,
+                    decision TEXT NOT NULL,
+                    confidence INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    entry_price REAL,
+                    entry_zone_low REAL,
+                    entry_zone_high REAL,
+                    stop_loss REAL,
+                    take_profit REAL,
+                    fill_at TEXT,
+                    fill_price REAL,
+                    close_at TEXT,
+                    close_price REAL,
+                    final_r REAL,
+                    mfe_price REAL,
+                    mae_price REAL,
+                    mfe_r REAL,
+                    mae_r REAL,
+                    last_observed_market_time TEXT,
+                    context_json TEXT NOT NULL,
+                    notes TEXT,
+                    FOREIGN KEY (advisory_usage_id) REFERENCES api_usage(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_paper_status
+                    ON paper_evaluations(status);
+                CREATE TABLE IF NOT EXISTS paper_checkpoints (
+                    paper_id INTEGER NOT NULL,
+                    checkpoint_minutes INTEGER NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    bid REAL NOT NULL,
+                    ask REAL NOT NULL,
+                    midpoint REAL NOT NULL,
+                    movement_points REAL,
+                    favorable_r REAL,
+                    adverse_r REAL,
+                    PRIMARY KEY (paper_id, checkpoint_minutes),
+                    FOREIGN KEY (paper_id) REFERENCES paper_evaluations(id)
+                );
                 """
             )
             # Serialize and atomically apply additive migrations. If the process
@@ -435,6 +556,125 @@ class SQLiteStateStore:
         timestamp = _utc_now(now)
         with closing(self._connect()) as connection:
             return _summary_from_connection(connection, timestamp)
+
+    def create_paper_evaluation(self, values: dict[str, Any]) -> int:
+        """Create the one paper record linked to a successful advisory."""
+
+        columns = (
+            "advisory_usage_id", "symbol", "candidate_time",
+            "advisory_completed_at", "tracking_start_market_time", "decision",
+            "confidence", "status", "entry_price", "entry_zone_low",
+            "entry_zone_high", "stop_loss", "take_profit", "context_json", "notes",
+        )
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    f"INSERT OR IGNORE INTO paper_evaluations ({','.join(columns)}) "
+                    f"VALUES ({','.join('?' for _ in columns)})",
+                    tuple(values.get(column) for column in columns),
+                )
+                row = connection.execute(
+                    "SELECT id FROM paper_evaluations WHERE advisory_usage_id = ?",
+                    (values["advisory_usage_id"],),
+                ).fetchone()
+                connection.commit()
+                if row is None:
+                    raise RuntimeError("Paper evaluation was not persisted")
+                return int(row["id"])
+            except Exception:
+                connection.rollback()
+                raise
+
+    def active_paper_evaluations(self) -> list[dict[str, Any]]:
+        with closing(self._connect()) as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM paper_evaluations
+                WHERE status IN ('PENDING_ENTRY', 'OPEN', 'OBSERVING')
+                ORDER BY id
+                """
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def paper_evaluation(self, paper_id: int) -> dict[str, Any] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                "SELECT * FROM paper_evaluations WHERE id = ?", (paper_id,)
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    def update_paper_evaluation(self, paper_id: int, values: dict[str, Any]) -> None:
+        allowed = {
+            "status", "fill_at", "fill_price", "close_at", "close_price",
+            "final_r", "mfe_price", "mae_price", "mfe_r", "mae_r",
+            "last_observed_market_time", "notes",
+        }
+        updates = {key: value for key, value in values.items() if key in allowed}
+        if not updates:
+            return
+        with closing(self._connect()) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    "UPDATE paper_evaluations SET "
+                    + ", ".join(f"{column} = ?" for column in updates)
+                    + " WHERE id = ?",
+                    (*updates.values(), paper_id),
+                )
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+
+    def add_paper_checkpoint(self, values: dict[str, Any]) -> None:
+        columns = (
+            "paper_id", "checkpoint_minutes", "observed_at", "bid", "ask",
+            "midpoint", "movement_points", "favorable_r", "adverse_r",
+        )
+        with closing(self._connect()) as connection:
+            connection.execute(
+                f"INSERT OR IGNORE INTO paper_checkpoints ({','.join(columns)}) "
+                f"VALUES ({','.join('?' for _ in columns)})",
+                tuple(values.get(column) for column in columns),
+            )
+
+    def paper_dashboard(self, history_limit: int = 20) -> dict[str, Any]:
+        """Return persisted paper state and aggregate statistics."""
+
+        with closing(self._connect()) as connection:
+            rows = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM paper_evaluations ORDER BY id DESC LIMIT ?",
+                    (history_limit,),
+                ).fetchall()
+            ]
+            checkpoints: dict[int, list[dict[str, Any]]] = {}
+            if rows:
+                ids = [int(row["id"]) for row in rows]
+                placeholders = ",".join("?" for _ in ids)
+                for checkpoint in connection.execute(
+                    f"SELECT * FROM paper_checkpoints WHERE paper_id IN ({placeholders}) "
+                    "ORDER BY checkpoint_minutes",
+                    ids,
+                ).fetchall():
+                    checkpoints.setdefault(int(checkpoint["paper_id"]), []).append(
+                        dict(checkpoint)
+                    )
+            all_rows = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM paper_evaluations ORDER BY id"
+                ).fetchall()
+            ]
+        for row in rows:
+            row["checkpoints"] = checkpoints.get(int(row["id"]), [])
+            try:
+                row["context"] = json.loads(row.pop("context_json"))
+            except (json.JSONDecodeError, TypeError):
+                row["context"] = None
+        return {"latest": rows[0] if rows else None, "history": rows, "stats": _paper_stats(all_rows)}
 
     @classmethod
     def usage_summary_read_only(

@@ -13,12 +13,15 @@ from .application_state import (
     build_application_state,
     disconnected_state,
 )
+from .advisory_service import AIAdvisoryService
+from .auto_advisory import AutomaticAdvisoryCoordinator
 from .collector import XAUUSDCollector
 from .config import Settings
 from .economic_calendar import EconomicCalendarCollector, EconomicCalendarGate
 from .market_gate import MarketGate
 from .mcp_client import MT5ReadOnlyClient
 from .preview import AIPreviewService
+from .paper import PaperPerformanceTracker
 from .state_store import PersistentStateUnavailableError, SQLiteStateStore
 from .timestamps import TimestampError, parse_timestamp, seconds_between
 
@@ -74,6 +77,16 @@ class MonitoringService:
         self.started_at = datetime.now(timezone.utc)
         self.events = EventFeed(limit=100)
         self.tracker = MeaningfulEventTracker(self.events)
+        self._state_store: SQLiteStateStore | None = None
+        self._paper_tracker: PaperPerformanceTracker | None = None
+        advisory_service = AIAdvisoryService(
+            settings.ai,
+            paper_config=settings.paper,
+        )
+        self.auto_advisory = AutomaticAdvisoryCoordinator(
+            settings.auto_advisory,
+            advisory_service,
+        )
         self.hub = StateHub(
             disconnected_state(
                 mode=mode,
@@ -175,6 +188,53 @@ class MonitoringService:
 
     async def _publish(self, snapshot: Any, news: Any) -> None:
         gate = MarketGate(self.settings.market_gate).evaluate(snapshot)
+        paper = self._paper_state(snapshot)
+        await self._publish_state(snapshot, gate, news, paper)
+
+        async def publish_analyzing() -> None:
+            await self._publish_state(snapshot, gate, news, self._read_paper_state())
+
+        outcome = await self.auto_advisory.maybe_evaluate(
+            snapshot,
+            gate,
+            news,
+            on_analyzing=publish_analyzing,
+        )
+        if outcome is not None:
+            await self._publish_state(snapshot, gate, news, self._read_paper_state())
+
+    def _paper_state(self, snapshot: Any) -> dict[str, Any]:
+        try:
+            if self._state_store is None:
+                self._state_store = SQLiteStateStore(
+                    self.settings.ai.state_db_path,
+                    legacy_reserve_usd=self.settings.ai.budget_reserve_per_call_usd,
+                )
+                self._paper_tracker = PaperPerformanceTracker(
+                    self._state_store, self.settings.paper
+                )
+            assert self._paper_tracker is not None
+            self._paper_tracker.observe(snapshot)
+            return self._state_store.paper_dashboard()
+        except Exception as exc:
+            LOGGER.warning("Paper tracking unavailable (%s)", type(exc).__name__)
+            return {"latest": None, "history": [], "stats": {}, "available": False}
+
+    def _read_paper_state(self) -> dict[str, Any]:
+        if self._state_store is None:
+            return {"latest": None, "history": [], "stats": {}, "available": False}
+        try:
+            return self._state_store.paper_dashboard()
+        except Exception:
+            return {"latest": None, "history": [], "stats": {}, "available": False}
+
+    async def _publish_state(
+        self,
+        snapshot: Any,
+        gate: Any,
+        news: Any,
+        paper: dict[str, Any],
+    ) -> None:
         preview = AIPreviewService(self.settings.ai).evaluate(snapshot, gate, news)
         try:
             last = SQLiteStateStore.last_advisory_read_only(
@@ -192,6 +252,8 @@ class MonitoringService:
             events=self.events,
             started_at=self.started_at,
             mode=self.mode,
+            auto_advisory=self.auto_advisory.state.to_dict(),
+            paper=paper,
         )
         self.tracker.update(state)
         state["events"] = self.events.to_list()

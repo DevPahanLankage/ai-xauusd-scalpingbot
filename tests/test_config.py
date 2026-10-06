@@ -4,7 +4,34 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from xauusd_bot.config import AIConfig, MarketGateConfig, Settings
+from xauusd_bot.config import (
+    AIConfig,
+    AutoAdvisoryConfig,
+    MarketGateConfig,
+    PaperConfig,
+    Settings,
+)
+
+
+class AutomaticAndPaperConfigurationTests(unittest.TestCase):
+    def test_automatic_advisory_defaults_off(self) -> None:
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(AutoAdvisoryConfig.from_environment().enabled)
+
+    def test_paper_horizons_and_checkpoints_are_environment_backed(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "XAUUSD_PAPER_ENTRY_EXPIRY_MINUTES": "7",
+                "XAUUSD_PAPER_MAX_TRADE_MINUTES": "25",
+                "XAUUSD_PAPER_CHECKPOINT_MINUTES": "5,1,5,10",
+            },
+            clear=True,
+        ):
+            config = PaperConfig.from_environment()
+        self.assertEqual(config.entry_expiry_minutes, 7)
+        self.assertEqual(config.max_trade_minutes, 25)
+        self.assertEqual(config.checkpoint_minutes, (1, 5, 10))
 
 
 class HistoryRequirementTests(unittest.TestCase):

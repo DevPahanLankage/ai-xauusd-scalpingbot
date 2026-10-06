@@ -63,6 +63,17 @@ def _boolean(name: str, default: bool) -> bool:
     raise ConfigurationError(f"{name} must be true or false")
 
 
+def _positive_int_tuple(name: str, default: tuple[int, ...]) -> tuple[int, ...]:
+    raw = os.getenv(name, ",".join(str(value) for value in default)).strip()
+    try:
+        values = tuple(sorted({int(value.strip()) for value in raw.split(",")}))
+    except ValueError as exc:
+        raise ConfigurationError(f"{name} must be a comma-separated list of integers") from exc
+    if not values or any(value <= 0 for value in values):
+        raise ConfigurationError(f"{name} values must be greater than zero")
+    return values
+
+
 @dataclass(frozen=True, slots=True)
 class MarketGateConfig:
     """All deterministic candidate and safety thresholds in one structure."""
@@ -223,6 +234,41 @@ class AIConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class AutoAdvisoryConfig:
+    """Explicit opt-in for automatic advisory evaluation."""
+
+    enabled: bool = False
+
+    @classmethod
+    def from_environment(cls) -> "AutoAdvisoryConfig":
+        return cls(enabled=_boolean("XAUUSD_AUTO_ADVISORY_ENABLED", False))
+
+
+@dataclass(frozen=True, slots=True)
+class PaperConfig:
+    """Paper-observation horizons; this configuration cannot execute trades."""
+
+    entry_expiry_minutes: int = 10
+    max_trade_minutes: int = 30
+    checkpoint_minutes: tuple[int, ...] = (1, 3, 5, 10, 15, 30)
+    max_observation_gap_seconds: float = 90.0
+
+    @classmethod
+    def from_environment(cls) -> "PaperConfig":
+        entry = _positive_int("XAUUSD_PAPER_ENTRY_EXPIRY_MINUTES", 10)
+        maximum = _positive_int("XAUUSD_PAPER_MAX_TRADE_MINUTES", 30)
+        checkpoints = _positive_int_tuple(
+            "XAUUSD_PAPER_CHECKPOINT_MINUTES", (1, 3, 5, 10, 15, 30)
+        )
+        return cls(
+            entry,
+            maximum,
+            checkpoints,
+            _positive_float("XAUUSD_PAPER_MAX_OBSERVATION_GAP_SECONDS", 90.0),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Settings:
     mcp_url: str
     mcp_token: str | None = field(default=None, repr=False)
@@ -235,6 +281,8 @@ class Settings:
     market_gate: MarketGateConfig = field(default_factory=MarketGateConfig)
     news_gate: NewsGateConfig = field(default_factory=NewsGateConfig)
     ai: AIConfig = field(default_factory=AIConfig)
+    auto_advisory: AutoAdvisoryConfig = field(default_factory=AutoAdvisoryConfig)
+    paper: PaperConfig = field(default_factory=PaperConfig)
     log_level: str = "INFO"
 
     @property
@@ -270,6 +318,8 @@ class Settings:
         market_gate = MarketGateConfig.from_environment()
         news_gate = NewsGateConfig.from_environment()
         ai = AIConfig.from_environment(state_base_path=state_base_path)
+        auto_advisory = AutoAdvisoryConfig.from_environment()
+        paper = PaperConfig.from_environment()
         tick_snapshot_limit = _positive_int("MT5_TICK_SNAPSHOT_LIMIT", 200)
         if tick_snapshot_limit < market_gate.min_recent_ticks:
             raise ConfigurationError(
@@ -287,5 +337,7 @@ class Settings:
             market_gate=market_gate,
             news_gate=news_gate,
             ai=ai,
+            auto_advisory=auto_advisory,
+            paper=paper,
             log_level=os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO",
         )

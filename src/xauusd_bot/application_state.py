@@ -192,6 +192,24 @@ class MeaningfulEventTracker:
                     key="advisory_cost",
                     fingerprint=advisory_stamp,
                 )
+        auto = state.get("auto_advisory") or {}
+        auto_fingerprint = f"{auto.get('candidate_time')}:{auto.get('state')}"
+        if auto.get("state") in {"ANALYZING", "BUY", "SELL", "NO_TRADE", "ERROR"} and self._previous.get("auto") != auto_fingerprint:
+            self.feed.add(
+                "AI",
+                f"Automatic advisory {auto.get('state')}",
+                key="auto_advisory",
+                fingerprint=auto_fingerprint,
+            )
+        paper = state.get("paper") or {}
+        paper_fingerprint = f"{paper.get('id')}:{paper.get('status')}"
+        if paper.get("id") and self._previous.get("paper") != paper_fingerprint:
+            self.feed.add(
+                "PAPER",
+                f"{paper.get('decision')} paper status {paper.get('status')}",
+                key="paper",
+                fingerprint=paper_fingerprint,
+            )
         self._previous = {
             "connected": system["mt5_connected"],
             "candidate": candidate,
@@ -199,6 +217,8 @@ class MeaningfulEventTracker:
             "alignment": alignment,
             "news_safe": news["safe_for_ai"],
             "advisory": advisory_stamp,
+            "auto": auto_fingerprint,
+            "paper": paper_fingerprint,
         }
 
 
@@ -256,6 +276,8 @@ def build_application_state(
     events: EventFeed,
     started_at: datetime,
     mode: str,
+    auto_advisory: dict[str, Any] | None = None,
+    paper: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     raw_codes = list(market_gate.rejection_reasons) + list(news_gate.rejection_reasons)
     for code in preview.skip_reasons:
@@ -268,6 +290,15 @@ def build_application_state(
         if not preview.credentials_configured
         else "ELIGIBLE" if eligible else "BLOCKED"
     )
+    auto = auto_advisory or {
+        "enabled": False, "state": "OFF", "candidate_time": None,
+        "last_call_time": None, "last_result": None, "reason": None,
+    }
+    if auto.get("enabled") and auto.get("state") in {
+        "ANALYZING", "BUY", "SELL", "NO_TRADE", "ERROR"
+    }:
+        ai_state = str(auto["state"])
+    paper_value = paper or {"latest": None, "history": [], "stats": {}}
     usage = preview.usage.to_dict() if preview.usage else None
     budget = preview.budget.to_dict() if preview.budget else None
     nearest = news_gate.nearest_event.to_dict() if news_gate.nearest_event else None
@@ -322,6 +353,10 @@ def build_application_state(
             "candidate_consumed": preview.candidate_consumed,
             "last_advisory": _last_advisory(last_advisory),
         },
+        "auto_advisory": auto,
+        "paper": paper_value.get("latest"),
+        "paper_stats": paper_value.get("stats", {}),
+        "paper_history": paper_value.get("history", []),
         "usage": {"summary": usage, "budget": budget},
         "account": {
             "currency": snapshot.account.currency,
@@ -367,6 +402,13 @@ def disconnected_state(*, mode: str, started_at: datetime, message: str, events:
         },
         "news_gate": None,
         "ai": {"state": "BLOCKED", "last_advisory": None},
+        "auto_advisory": {
+            "enabled": False, "state": "OFF", "candidate_time": None,
+            "last_call_time": None, "last_result": None, "reason": "mt5_disconnected",
+        },
+        "paper": None,
+        "paper_stats": {},
+        "paper_history": [],
         "usage": None,
         "account": None,
         "chart": {"m1": [], "m5": []},

@@ -84,7 +84,7 @@ async def _run_ai(settings: Settings, json_output: bool) -> None:
             "OPENAI_API_KEY is not configured; an otherwise eligible candidate will be skipped"
         )
     snapshot, market_gate, news_gate = await _collect_ai_context(settings)
-    outcome = await AIAdvisoryService(settings.ai).evaluate(
+    outcome = await AIAdvisoryService(settings.ai, paper_config=settings.paper).evaluate(
         snapshot, market_gate, news_gate
     )
     print(
