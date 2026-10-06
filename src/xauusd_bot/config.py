@@ -175,7 +175,7 @@ class AIConfig:
     state_db_path: Path = Path(".state/xauusd_bot.sqlite3")
 
     @classmethod
-    def from_environment(cls) -> "AIConfig":
+    def from_environment(cls, *, state_base_path: Path | None = None) -> "AIConfig":
         effort = os.getenv("OPENAI_REASONING_EFFORT", "low").strip().lower()
         if effort not in {"low", "medium", "high", "xhigh", "max"}:
             raise ConfigurationError(
@@ -186,6 +186,9 @@ class AIConfig:
         ).strip()
         if not state_path:
             raise ConfigurationError("XAUUSD_AI_STATE_DB must not be empty")
+        configured_state_path = Path(state_path).expanduser()
+        if state_base_path is not None and not configured_state_path.is_absolute():
+            configured_state_path = state_base_path / configured_state_path
         return cls(
             api_key=os.getenv("OPENAI_API_KEY", "").strip() or None,
             model=os.getenv("OPENAI_MODEL", "gpt-6.1-sol").strip() or "gpt-6.1-sol",
@@ -215,7 +218,7 @@ class AIConfig:
             max_price_distance_volatility_multiple=_positive_float(
                 "OPENAI_MAX_PRICE_DISTANCE_VOLATILITY_MULTIPLE", 10.0
             ),
-            state_db_path=Path(state_path),
+            state_db_path=configured_state_path,
         )
 
 
@@ -254,7 +257,9 @@ class Settings:
         )
 
     @classmethod
-    def from_environment(cls) -> "Settings":
+    def from_environment(
+        cls, *, state_base_path: Path | None = None
+    ) -> "Settings":
         url = os.getenv("MT5_MCP_URL", "").strip()
         if not url:
             raise ConfigurationError("MT5_MCP_URL is required")
@@ -264,7 +269,7 @@ class Settings:
         token = os.getenv("MT5_MCP_TOKEN", "").strip() or None
         market_gate = MarketGateConfig.from_environment()
         news_gate = NewsGateConfig.from_environment()
-        ai = AIConfig.from_environment()
+        ai = AIConfig.from_environment(state_base_path=state_base_path)
         tick_snapshot_limit = _positive_int("MT5_TICK_SNAPSHOT_LIMIT", 200)
         if tick_snapshot_limit < market_gate.min_recent_ticks:
             raise ConfigurationError(

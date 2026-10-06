@@ -22,6 +22,9 @@ from .webapp import create_web_app
 
 LOCAL_HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+APP_DATA_DIRECTORY = "XAUUSD-AI"
+ENABLE_PROCESSED_OUTPUT = 0x0001
+ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,22 +54,76 @@ def runtime_env_path() -> Path:
     return Path.cwd() / ".env"
 
 
-def _ensure_console() -> None:
+def runtime_state_base_path() -> Path:
+    """Return the deterministic base for a relative desktop state DB path."""
+
+    if getattr(sys, "frozen", False):
+        local_app_data = os.getenv("LOCALAPPDATA", "").strip()
+        if local_app_data:
+            return Path(local_app_data) / APP_DATA_DIRECTORY
+        return Path(sys.executable).resolve().parent / "data"
+    return runtime_env_path().resolve().parent
+
+
+def _enable_windows_vt_mode(kernel32: object, handle: int) -> bool:
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32.GetConsoleMode.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.GetConsoleMode.restype = wintypes.BOOL
+    kernel32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+    kernel32.SetConsoleMode.restype = wintypes.BOOL
+    mode = wintypes.DWORD()
+    if not handle or not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+        return False
+    target = mode.value | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    return bool(kernel32.SetConsoleMode(handle, target))
+
+
+def _enable_windows_vt_for_stream(kernel32: object, stream: object) -> bool:
+    try:
+        import msvcrt
+
+        handle = msvcrt.get_osfhandle(stream.fileno())
+    except (AttributeError, OSError, ValueError):
+        return False
+    return _enable_windows_vt_mode(kernel32, handle)
+
+
+def _ensure_console() -> tuple[bool, bool]:
     if os.name != "nt":
-        return
+        return (False, False)
     import ctypes
 
     kernel32 = ctypes.windll.kernel32
-    if kernel32.GetConsoleWindow():
-        return
-    if not kernel32.AttachConsole(-1):
-        kernel32.AllocConsole()
-    try:
-        sys.stdout = open("CONOUT$", "w", encoding="utf-8", buffering=1)
-        sys.stderr = open("CONOUT$", "w", encoding="utf-8", buffering=1)
-        sys.stdin = open("CONIN$", "r", encoding="utf-8")
-    except OSError:
-        pass
+    console_was_present = bool(kernel32.GetConsoleWindow())
+    console_available = console_was_present
+    if not console_available:
+        console_available = bool(kernel32.AttachConsole(-1))
+        if not console_available:
+            console_available = bool(kernel32.AllocConsole())
+    if not console_available:
+        return (False, False)
+
+    # A windowed PyInstaller process has no Python console streams even after
+    # AttachConsole/AllocConsole. Rebind only for that case; preserve source-mode
+    # streams and redirection when Python already owns a console.
+    if not console_was_present or sys.stdout is None or sys.stderr is None:
+        try:
+            sys.stdout = open("CONOUT$", "w", encoding="utf-8", buffering=1)
+            sys.stderr = open("CONOUT$", "w", encoding="utf-8", buffering=1)
+            sys.stdin = open("CONIN$", "r", encoding="utf-8")
+        except OSError:
+            return (False, False)
+
+    kernel32.SetConsoleOutputCP(65001)
+    kernel32.SetConsoleCP(65001)
+    stdout_vt = _enable_windows_vt_for_stream(kernel32, sys.stdout)
+    stderr_vt = _enable_windows_vt_for_stream(kernel32, sys.stderr)
+    return (stdout_vt, stderr_vt)
 
 
 def _show_error(message: str, *, browser_only: bool) -> None:
@@ -89,10 +146,18 @@ def _port_available(port: int) -> bool:
 
 
 class DesktopApplication:
-    def __init__(self, settings: Settings, mode: LaunchMode, *, port: int = DEFAULT_PORT) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        mode: LaunchMode,
+        *,
+        port: int = DEFAULT_PORT,
+        force_terminal: bool | None = None,
+    ) -> None:
         self.settings = settings
         self.mode = mode
         self.port = port
+        self.force_terminal = force_terminal
         self.stop_event = asyncio.Event()
         self.monitor = MonitoringService(settings, mode=mode.name)
 
@@ -147,7 +212,11 @@ class DesktopApplication:
         if self.mode.show_cli:
             tasks.append(
                 asyncio.create_task(
-                    run_rich_dashboard(self.monitor.hub, self.stop_event),
+                    run_rich_dashboard(
+                        self.monitor.hub,
+                        self.stop_event,
+                        force_terminal=self.force_terminal,
+                    ),
                     name="rich-cli",
                 )
             )
@@ -195,11 +264,16 @@ class DesktopApplication:
 
 def main(argv: Sequence[str] | None = None) -> None:
     mode = parse_launch_mode(argv)
+    force_terminal: bool | None = None
     if mode.show_cli:
-        _ensure_console()
-    load_dotenv(runtime_env_path(), override=False)
+        stdout_vt, _ = _ensure_console()
+        force_terminal = True if stdout_vt else None
+    environment_path = runtime_env_path()
+    load_dotenv(environment_path, override=False)
     try:
-        settings = Settings.from_environment()
+        settings = Settings.from_environment(
+            state_base_path=runtime_state_base_path()
+        )
     except ConfigurationError as exc:
         _show_error(f"Configuration error: {exc}", browser_only=not mode.show_cli)
         raise SystemExit(2) from exc
@@ -209,7 +283,13 @@ def main(argv: Sequence[str] | None = None) -> None:
         console=mode.show_cli,
     )
     try:
-        asyncio.run(DesktopApplication(settings, mode).run())
+        asyncio.run(
+            DesktopApplication(
+                settings,
+                mode,
+                force_terminal=force_terminal,
+            ).run()
+        )
     except KeyboardInterrupt:
         return
     except Exception as exc:

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from typing import Any
 
 from rich.columns import Columns
-from rich.console import Group
+from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
 from rich.table import Table
@@ -173,9 +174,25 @@ def render_dashboard(state: dict[str, Any]) -> Group:
     return Group(*panels)
 
 
-async def run_rich_dashboard(hub: StateHub, stop_event: Any) -> None:
+async def run_rich_dashboard(
+    hub: StateHub,
+    stop_event: Any,
+    *,
+    force_terminal: bool | None = None,
+) -> None:
     revision = -1
-    with Live(refresh_per_second=4, screen=False) as live:
+    rich_environment = None
+    if force_terminal:
+        rich_environment = dict(os.environ)
+        # A verified Windows VT console is interactive even when the parent
+        # process supplied TERM=dumb (common in launchers and test harnesses).
+        rich_environment.pop("TERM", None)
+    console = Console(
+        force_terminal=force_terminal,
+        legacy_windows=False if force_terminal else None,
+        _environ=rich_environment,
+    )
+    with Live(console=console, refresh_per_second=4, screen=False) as live:
         while not stop_event.is_set():
             try:
                 revision, state = await asyncio_wait_state(hub, revision, stop_event)

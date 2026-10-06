@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import tempfile
 import unittest
@@ -121,6 +122,61 @@ class ApplicationStateTests(unittest.TestCase):
         state["market"]["bid"] += 0.01
         tracker.update(state)
         self.assertEqual(len(feed.to_list()), count)
+
+    def test_alignment_rejection_transition_emits_one_semantic_event(self) -> None:
+        feed = EventFeed()
+        tracker = MeaningfulEventTracker(feed)
+        state = self.state(feed=feed)
+        tracker.update(state)
+        baseline = len(feed.to_list())
+
+        blocked = copy.deepcopy(state)
+        blocked["validity"]["eligible"] = False
+        blocked["validity"]["reasons"] = [
+            {
+                "code": "m1_m5_directions_not_aligned",
+                "message": "M1 and M5 directions are not aligned",
+            }
+        ]
+        blocked["market_gate"]["directions_aligned"] = False
+        blocked["market_gate"]["direction_m5"] = "UP"
+        tracker.update(blocked)
+
+        transition = feed.to_list()[baseline:]
+        self.assertEqual(len(transition), 1)
+        self.assertEqual(transition[0]["message"], "M1/M5 directions not aligned")
+
+    def test_distinct_spread_and_alignment_rejections_remain_separate(self) -> None:
+        feed = EventFeed()
+        tracker = MeaningfulEventTracker(feed)
+        state = self.state(feed=feed)
+        tracker.update(state)
+        baseline = len(feed.to_list())
+
+        blocked = copy.deepcopy(state)
+        blocked["validity"]["eligible"] = False
+        blocked["validity"]["reasons"] = [
+            {
+                "code": "spread_exceeds_absolute_limit",
+                "message": "Spread exceeds the configured absolute limit",
+            },
+            {
+                "code": "m1_m5_directions_not_aligned",
+                "message": "M1 and M5 directions are not aligned",
+            },
+        ]
+        blocked["market_gate"]["directions_aligned"] = False
+        blocked["market_gate"]["direction_m5"] = "UP"
+        tracker.update(blocked)
+
+        messages = [item["message"] for item in feed.to_list()[baseline:]]
+        self.assertEqual(
+            messages,
+            [
+                "Spread exceeds the configured absolute limit",
+                "M1/M5 directions not aligned",
+            ],
+        )
 
 
 if __name__ == "__main__":

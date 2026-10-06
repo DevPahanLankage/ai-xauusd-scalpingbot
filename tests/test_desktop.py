@@ -1,19 +1,31 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import socket
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
 from xauusd_bot.config import AIConfig, MarketGateConfig, Settings
-from xauusd_bot.desktop import DesktopApplication, LOCAL_HOST, parse_launch_mode
+from xauusd_bot.desktop import (
+    APP_DATA_DIRECTORY,
+    ENABLE_PROCESSED_OUTPUT,
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+    DesktopApplication,
+    LOCAL_HOST,
+    _enable_windows_vt_mode,
+    parse_launch_mode,
+    runtime_state_base_path,
+)
 from xauusd_bot.economic_calendar import EconomicCalendarGate
 from xauusd_bot.market_gate import MarketGate
 from xauusd_bot.monitor import MonitoringService, StateHub
+from xauusd_bot.rich_dashboard import run_rich_dashboard
 from xauusd_bot.webapp import _local, create_web_app
 from tests.test_market_gate import _snapshot
 
@@ -40,6 +52,44 @@ class LaunchModeTests(unittest.TestCase):
         self.assertEqual(LOCAL_HOST, "127.0.0.1")
         self.assertTrue(_local("127.0.0.1"))
         self.assertFalse(_local("192.168.1.5"))
+
+    def test_packaged_relative_state_base_uses_local_app_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            sys, "frozen", True, create=True
+        ), patch.dict(os.environ, {"LOCALAPPDATA": temporary}):
+            self.assertEqual(
+                runtime_state_base_path(), Path(temporary) / APP_DATA_DIRECTORY
+            )
+
+    def test_source_state_base_uses_environment_file_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, patch.object(
+            sys, "frozen", False, create=True
+        ), patch("xauusd_bot.desktop.runtime_env_path", return_value=Path(temporary) / ".env"):
+            self.assertEqual(runtime_state_base_path(), Path(temporary))
+
+    def test_virtual_terminal_processing_is_enabled_without_dropping_modes(self) -> None:
+        kernel32 = MagicMock()
+
+        def get_console_mode(_handle, pointer):
+            pointer._obj.value = 0x0002
+            return True
+
+        kernel32.GetConsoleMode.side_effect = get_console_mode
+        kernel32.SetConsoleMode.return_value = True
+        self.assertTrue(_enable_windows_vt_mode(kernel32, 123))
+        configured = kernel32.SetConsoleMode.call_args.args[1]
+        self.assertEqual(configured & 0x0002, 0x0002)
+        self.assertEqual(configured & ENABLE_PROCESSED_OUTPUT, ENABLE_PROCESSED_OUTPUT)
+        self.assertEqual(
+            configured & ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+            ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        )
+
+    def test_virtual_terminal_setup_fails_closed_for_non_console_handle(self) -> None:
+        kernel32 = MagicMock()
+        kernel32.GetConsoleMode.return_value = False
+        self.assertFalse(_enable_windows_vt_mode(kernel32, 123))
+        kernel32.SetConsoleMode.assert_not_called()
 
 
 class WebApplicationTests(unittest.TestCase):
@@ -97,12 +147,39 @@ class DesktopLifecycleTests(unittest.IsolatedAsyncioTestCase):
     def settings(self) -> Settings:
         return Settings(mcp_url="http://127.0.0.1/mcp")
 
+    async def test_rich_dashboard_forces_modern_terminal_after_vt_setup(self) -> None:
+        stop_event = asyncio.Event()
+        stop_event.set()
+        console = MagicMock()
+        live = MagicMock()
+        with (
+            patch("xauusd_bot.rich_dashboard.Console", return_value=console) as factory,
+            patch("xauusd_bot.rich_dashboard.Live", return_value=live) as live_factory,
+            patch.dict(os.environ, {"TERM": "dumb"}),
+        ):
+            await run_rich_dashboard(
+                MagicMock(), stop_event, force_terminal=True
+            )
+        console_options = factory.call_args.kwargs
+        self.assertTrue(console_options["force_terminal"])
+        self.assertFalse(console_options["legacy_windows"])
+        self.assertNotIn("TERM", console_options["_environ"])
+        live_factory.assert_called_once_with(
+            console=console, refresh_per_second=4, screen=False
+        )
+
     async def test_cli_only_starts_no_server_or_browser_and_stops_cleanly(self) -> None:
-        application = DesktopApplication(self.settings(), parse_launch_mode(["--cli-only"]))
+        application = DesktopApplication(
+            self.settings(),
+            parse_launch_mode(["--cli-only"]),
+            force_terminal=True,
+        )
         monitor = _FakeMonitor()
         application.monitor = monitor
+        terminal_settings: list[bool | None] = []
 
-        async def cli(_hub, stop_event):
+        async def cli(_hub, stop_event, *, force_terminal=None):
+            terminal_settings.append(force_terminal)
             await stop_event.wait()
 
         with (
@@ -115,6 +192,7 @@ class DesktopLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await asyncio.wait_for(task, timeout=2)
         self.assertTrue(monitor.started)
         self.assertTrue(monitor.stopped)
+        self.assertEqual(terminal_settings, [True])
         browser.assert_not_called()
 
     async def test_windows_console_control_requests_clean_shutdown(self) -> None:

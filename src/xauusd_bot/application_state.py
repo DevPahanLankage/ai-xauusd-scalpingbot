@@ -133,7 +133,20 @@ class MeaningfulEventTracker:
                 key="candidate",
                 fingerprint=candidate,
             )
-        if self._previous.get("valid") != validity["eligible"]:
+        alignment = (gate["directions_aligned"], gate["direction_m1"], gate["direction_m5"])
+        alignment_changed = self._previous.get("alignment") not in (None, alignment)
+        alignment_is_primary_rejection = bool(
+            not validity["eligible"]
+            and validity["reasons"]
+            and validity["reasons"][0].get("code")
+            == "m1_m5_directions_not_aligned"
+            and alignment_changed
+            and not gate["directions_aligned"]
+        )
+        if (
+            self._previous.get("valid") != validity["eligible"]
+            and not alignment_is_primary_rejection
+        ):
             self.feed.add(
                 "VALID" if validity["eligible"] else "BLOCKED",
                 "Setup passed deterministic gates"
@@ -141,12 +154,11 @@ class MeaningfulEventTracker:
                 else validity["reasons"][0]["message"] if validity["reasons"] else "Setup blocked",
                 key="validity",
             )
-        alignment = (gate["directions_aligned"], gate["direction_m1"], gate["direction_m5"])
-        if self._previous.get("alignment") not in (None, alignment):
+        if alignment_changed:
             message = (
                 f"M1/M5 aligned {gate['direction_m1']}"
                 if gate["directions_aligned"]
-                else "M1/M5 directions no longer aligned"
+                else "M1/M5 directions not aligned"
             )
             self.feed.add("VALID" if gate["directions_aligned"] else "BLOCKED", message, key="alignment")
         if self._previous.get("news_safe") not in (None, news["safe_for_ai"]):

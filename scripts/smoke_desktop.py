@@ -112,6 +112,13 @@ def _environment() -> tuple[dict[str, str], list[str]]:
                 secrets.append(value)
     # The smoke test must be incapable of making a paid request.
     environment["OPENAI_API_KEY"] = ""
+    state_path = Path(
+        environment.get("XAUUSD_AI_STATE_DB", ".state/xauusd_bot.sqlite3")
+    ).expanduser()
+    if not state_path.is_absolute():
+        state_path = ROOT / state_path
+    # Validate the packaged app against the same existing DB as the developer CLI.
+    environment["XAUUSD_AI_STATE_DB"] = str(state_path)
     return environment, secrets
 
 
@@ -146,6 +153,17 @@ def _web_mode(mode: str) -> dict[str, Any]:
             "listener_addresses": addresses,
             "ai_state": (state.get("ai") or {}).get("state"),
             "mt5_connected": (state.get("system") or {}).get("mt5_connected"),
+            "calls_today": ((state.get("usage") or {}).get("summary") or {}).get(
+                "calls_today"
+            ),
+            "known_spend_today_usd": (
+                ((state.get("usage") or {}).get("summary") or {}).get(
+                    "known_spend_today_usd"
+                )
+            ),
+            "last_advisory_present": bool(
+                (state.get("ai") or {}).get("last_advisory")
+            ),
             "safe_payload": True,
         }
         _request("/api/exit", method="POST")

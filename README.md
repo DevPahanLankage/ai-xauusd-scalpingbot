@@ -114,6 +114,35 @@ serialized into browser state. The browser may receive local balance, equity, fr
 margin, and position count, but never account login, broker/server identity, MCP token,
 OpenAI key, credentials, or authorization headers.
 
+Persistent state paths are deterministic:
+
+- The normal developer CLI preserves its existing behavior: a relative
+  `XAUUSD_AI_STATE_DB` is relative to the directory from which the CLI is run.
+- The source desktop resolves a relative path against the directory containing the
+  project `.env`.
+- The packaged executable resolves a relative path under
+  `%LOCALAPPDATA%\XAUUSD-AI`. With the default value, the packaged database is
+  `%LOCALAPPDATA%\XAUUSD-AI\.state\xauusd_bot.sqlite3`.
+- An absolute `XAUUSD_AI_STATE_DB` is always used exactly as configured. Use this when
+  the source CLI and packaged desktop should intentionally share one database.
+
+To retain an independent packaged copy of existing development history, close every
+source and packaged instance first. Confirm that the destination does not exist, then
+copy the database explicitly:
+
+```powershell
+$source = Resolve-Path '.state\xauusd_bot.sqlite3'
+$targetDirectory = Join-Path $env:LOCALAPPDATA 'XAUUSD-AI\.state'
+$target = Join-Path $targetDirectory 'xauusd_bot.sqlite3'
+if (Test-Path -LiteralPath $target) { throw "Destination already exists: $target" }
+New-Item -ItemType Directory -Path $targetDirectory -Force | Out-Null
+Copy-Item -LiteralPath $source -Destination $target
+```
+
+This migration is never automatic and never overwrites an existing packaged database.
+Alternatively, set the packaged `.env` to the absolute source database path so usage,
+candidate reservations, and advisory history all continue from that single file.
+
 ### Dashboard screenshot
 
 _Placeholder: add a current dashboard screenshot after a release build is selected._
@@ -235,7 +264,8 @@ limit and ensures that adding the configured per-call budget reserve would not c
 the daily or weekly cap. Only then does it reserve both the completed M1 candidate and
 budget. The default reserve is $0.05. Known response cost replaces the reserve; a
 timeout, failure, or crash with unknown usage retains it conservatively. The default
-database is `.state/xauusd_bot.sqlite3`, which is ignored by Git. A unique
+database is `.state/xauusd_bot.sqlite3`, which is ignored by Git. Desktop path
+resolution is documented under Packaged configuration above. A unique
 `(symbol, completed_m1_time)` key prevents duplicate spend across threads and process
 restarts. Existing databases are migrated in place. `--usage` reports reported known
 spend separately from conservative budget-accounted spend.
@@ -265,6 +295,10 @@ override.
   mode remains independent of frontend assets.
 - **Packaged app cannot find configuration:** verify `.env` is beside the executable,
   not inside the repository build directory by assumption.
+- **Packaged usage/advisory history is empty:** either copy the development database
+  to the documented `%LOCALAPPDATA%` location while all app instances are stopped, or
+  configure one absolute `XAUUSD_AI_STATE_DB` path in both environments. The app never
+  searches for or overwrites another database implicitly.
 
 ## Development validation
 
