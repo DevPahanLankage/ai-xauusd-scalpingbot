@@ -169,7 +169,8 @@ class PaperPerformanceTracker:
         status = str(row["status"])
         updates: dict[str, Any] = {"last_observed_market_time": snapshot.trade_server_time}
         if status == "OBSERVING":
-            if seconds_between(now, start) >= max(self.config.checkpoint_minutes) * 60:
+            captured = self.store.paper_checkpoint_minutes(paper_id)
+            if set(self.config.checkpoint_minutes).issubset(captured):
                 updates["status"] = "OBSERVATION_COMPLETE"
             self.store.update_paper_evaluation(paper_id, updates)
             return

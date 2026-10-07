@@ -294,6 +294,19 @@ dispositions, AI conversion, and separate candidate/call counts by MT5 server ho
 Checkpoint excursions are explicitly labeled as sampled midpoint observations, not
 intraperiod tick highs/lows or hypothetical trade outcomes.
 
+Export the exact sanitized user input retained for a post-migration advisory without
+contacting MT5 or OpenAI or writing SQLite:
+
+```powershell
+.venv\Scripts\python -m xauusd_bot --advisory-input 57 --json
+.venv\Scripts\python -m xauusd_bot --advisory-input 57 --packaged-state --json
+```
+
+Legacy advisories clearly report that their exact input is unavailable; the command
+does not reconstruct missing candles or ticks. New advisory reservations atomically
+retain the canonical payload JSON and hash, model/reasoning settings, candidate time,
+advisory-schema version, and deterministic system-prompt version/hash.
+
 Tests:
 
 ```powershell
@@ -325,6 +338,11 @@ resolution is documented under Packaged configuration above. A unique
 `(symbol, completed_m1_time)` key prevents duplicate spend across threads and process
 restarts. Existing databases are migrated in place. `--usage` reports reported known
 spend separately from conservative budget-accounted spend.
+
+Research candidate terminal dispositions and their original timestamps are immutable.
+Later same-candle gate/news refresh state is stored separately as the latest research
+observation, so it cannot rewrite a historical `SENT_TO_AI`, `AI_ERROR`, or other
+terminal outcome.
 
 Automatic mode optionally applies a durable paid-call interval with
 `XAUUSD_AUTO_ADVISORY_MIN_INTERVAL_MINUTES`. Its default is `0` (legacy behavior).

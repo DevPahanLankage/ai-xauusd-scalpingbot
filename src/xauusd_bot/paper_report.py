@@ -503,11 +503,19 @@ def build_paper_report(
         "model_reported_timestamp_warnings": 0,
         "missing_paper_rows": 0,
         "missing_checkpoints": 0,
+        "false_complete_missing_checkpoints": 0,
         "observation_gap_records": 0,
         "incomplete_no_trade_observations": 0,
         "advisory_context_mismatches": 0,
         "missing_context_fields": 0,
         "inconsistent_cost_rows": 0,
+        "terminal_disposition_mismatches": 0,
+        "sent_advisory_disposition_mismatches": 0,
+        "legacy_overwritten_terminal_dispositions": 0,
+        "missing_sanitized_advisory_inputs": 0,
+        "legacy_missing_sanitized_advisory_inputs": 0,
+        "missing_prompt_versions": 0,
+        "legacy_missing_prompt_versions": 0,
         "warnings": [],
     }
     with closing(_connect_read_only(resolved)) as connection:
@@ -572,6 +580,36 @@ def build_paper_report(
                 "research_candidates table is missing (older database)"
             )
 
+        observation_rows: list[dict[str, Any]] = []
+        if "research_candidate_observations" in tables:
+            observation_rows = [
+                dict(row)
+                for row in connection.execute(
+                    "SELECT * FROM research_candidate_observations"
+                )
+            ]
+
+        advisory_input_rows: dict[int, dict[str, Any]] = {}
+        legacy_input_max_id = max(usage_ids, default=0)
+        if "advisory_inputs" in tables:
+            advisory_input_rows = {
+                int(row["usage_id"]): dict(row)
+                for row in connection.execute("SELECT * FROM advisory_inputs")
+                if int(row["usage_id"]) in usage_ids
+            }
+            if "state_metadata" in tables:
+                boundary = connection.execute(
+                    """
+                    SELECT value FROM state_metadata
+                    WHERE key='advisory_input_legacy_max_usage_id'
+                    """
+                ).fetchone()
+                if boundary is not None:
+                    try:
+                        legacy_input_max_id = int(boundary["value"])
+                    except (TypeError, ValueError):
+                        quality["timestamp_problems"] += 1
+
     decisions_by_usage: dict[int, dict[str, Any]] = {}
     for row in api_rows:
         decision, malformed = _decision_data(row)
@@ -625,9 +663,47 @@ def build_paper_report(
     checkpoint_keys = set(checkpoint_counts)
     for row in paper_rows:
         if row.get("decision") == "NO_TRADE" and row.get("status") == "OBSERVATION_COMPLETE":
-            quality["missing_checkpoints"] += sum(
+            missing = sum(
                 (int(row["id"]), minute) not in checkpoint_keys for minute in CHECKPOINT_MINUTES
             )
+            quality["missing_checkpoints"] += missing
+            quality["false_complete_missing_checkpoints"] += missing
+
+    missing_input_ids = usage_ids - set(advisory_input_rows)
+    for usage_id in missing_input_ids:
+        if usage_id <= legacy_input_max_id:
+            quality["legacy_missing_sanitized_advisory_inputs"] += 1
+            quality["legacy_missing_prompt_versions"] += 1
+        else:
+            quality["missing_sanitized_advisory_inputs"] += 1
+            quality["missing_prompt_versions"] += 1
+    quality["missing_prompt_versions"] += sum(
+        not str(row.get("prompt_version") or "").strip()
+        or not str(row.get("system_prompt_sha256") or "").strip()
+        for row in advisory_input_rows.values()
+    )
+
+    for row in research_rows:
+        linked = row.get("advisory_usage_id") is not None
+        terminal = row.get("terminal_disposition")
+        if terminal:
+            if row.get("disposition") != terminal:
+                quality["terminal_disposition_mismatches"] += 1
+            if linked and terminal not in {"SENT_TO_AI", "AI_ERROR"}:
+                quality["sent_advisory_disposition_mismatches"] += 1
+        elif linked and row.get("decision") in DECISIONS:
+            if row.get("disposition") not in {"SENT_TO_AI", "AI_ERROR"}:
+                quality["legacy_overwritten_terminal_dispositions"] += 1
+
+    if quality["legacy_missing_sanitized_advisory_inputs"]:
+        quality["warnings"].append(
+            "Legacy advisories predate exact sanitized-input and prompt-version persistence."
+        )
+    if quality["legacy_overwritten_terminal_dispositions"]:
+        quality["warnings"].append(
+            "Legacy candidate dispositions were overwritten after linked AI calls; "
+            "advisory linkage is used as terminal-event evidence."
+        )
     for row in api_rows:
         cost = row.get("estimated_cost_usd")
         numeric = _finite(cost)
@@ -725,28 +801,71 @@ def build_paper_report(
             "timestamp_problems", "missing_paper_rows", "missing_checkpoints",
             "observation_gap_records", "incomplete_no_trade_observations",
             "advisory_context_mismatches", "missing_context_fields", "inconsistent_cost_rows",
+            "terminal_disposition_mismatches",
+            "sent_advisory_disposition_mismatches",
+            "missing_sanitized_advisory_inputs",
+            "missing_prompt_versions",
         )
     )
     patterns = _context_patterns(paper_rows, contexts)
     patterns["market_regime"] = _group_counts(
         str(decision.get("market_regime") or "UNKNOWN") for decision in no_trade_decisions
     )
-    disposition_counts = Counter(str(row.get("disposition")) for row in research_rows)
-    market_eligible = sum(bool(row.get("market_gate_eligible")) for row in research_rows)
+    def terminal_disposition(row: dict[str, Any]) -> str:
+        persisted = row.get("terminal_disposition")
+        if persisted:
+            return str(persisted)
+        if row.get("advisory_usage_id") is not None and row.get("decision") in DECISIONS:
+            # Backward-compatible evidence for legacy rows affected by the old
+            # same-candle overwrite bug. This is reporting only; no row is repaired.
+            return "SENT_TO_AI"
+        return str(row.get("disposition"))
+
+    disposition_counts = Counter(terminal_disposition(row) for row in research_rows)
+    def candidate_market_eligible(row: dict[str, Any]) -> bool:
+        usage_id = row.get("advisory_usage_id")
+        context = context_by_usage.get(int(usage_id)) if usage_id is not None else None
+        gate = (context or {}).get("market_gate")
+        if isinstance(gate, dict) and "eligible_for_ai" in gate:
+            return bool(gate["eligible_for_ai"])
+        return bool(row.get("market_gate_eligible"))
+
+    def candidate_news_safe(row: dict[str, Any]) -> bool:
+        usage_id = row.get("advisory_usage_id")
+        context = context_by_usage.get(int(usage_id)) if usage_id is not None else None
+        gate = (context or {}).get("news_gate")
+        if isinstance(gate, dict) and "safe_for_ai" in gate:
+            return bool(gate["safe_for_ai"])
+        return bool(row.get("news_safe"))
+
+    market_eligible = sum(candidate_market_eligible(row) for row in research_rows)
     market_rejected = len(research_rows) - market_eligible
     news_blocked = sum(
-        bool(row.get("market_gate_eligible")) and not bool(row.get("news_safe"))
+        candidate_market_eligible(row) and not candidate_news_safe(row)
         for row in research_rows
     )
     fully_eligible = sum(
-        bool(row.get("market_gate_eligible")) and bool(row.get("news_safe"))
+        candidate_market_eligible(row) and candidate_news_safe(row)
         for row in research_rows
     )
     sent = disposition_counts["SENT_TO_AI"] + disposition_counts["AI_ERROR"]
     sent_decisions = [
         str(row.get("decision")) for row in research_rows
-        if row.get("disposition") == "SENT_TO_AI" and row.get("decision") in DECISIONS
+        if terminal_disposition(row) == "SENT_TO_AI" and row.get("decision") in DECISIONS
     ]
+    research_keys = {
+        (str(row.get("symbol", "")).upper(), str(row.get("completed_m1_time", "")))
+        for row in research_rows
+    }
+    latest_observation_counts = Counter(
+        str(row.get("observation_disposition"))
+        for row in observation_rows
+        if (
+            str(row.get("symbol", "")).upper(),
+            str(row.get("completed_m1_time", "")),
+        )
+        in research_keys
+    )
     directional_sent = sum(value in {"BUY", "SELL"} for value in sent_decisions)
     return {
         "schema_version": "1.0",
@@ -817,6 +936,21 @@ def build_paper_report(
             "budget_blocked": disposition_counts["BUDGET_BLOCKED"],
             "sent_to_ai": sent,
             "dispositions": dict(sorted(disposition_counts.items())),
+            "latest_observation_dispositions": dict(
+                sorted(latest_observation_counts.items())
+            ),
+        },
+        "advisory_input_replay": {
+            "replayable": len(advisory_input_rows),
+            "legacy_unavailable": quality[
+                "legacy_missing_sanitized_advisory_inputs"
+            ],
+            "missing_new_schema": quality["missing_sanitized_advisory_inputs"],
+            "prompt_versioned": sum(
+                bool(str(row.get("prompt_version") or "").strip())
+                and bool(str(row.get("system_prompt_sha256") or "").strip())
+                for row in advisory_input_rows.values()
+            ),
         },
         "ai_conversion": {
             "eligible_deterministic_candidates": fully_eligible,
@@ -971,6 +1105,7 @@ def paper_report_to_human(report: dict[str, Any]) -> str:
     efficiency = report["candidate_efficiency"]
     candidates = report["deterministic_candidates"]
     conversion = report["ai_conversion"]
+    replay = report["advisory_input_replay"]
     lines.extend(
         [
             "",
@@ -980,6 +1115,24 @@ def paper_report_to_human(report: dict[str, Any]) -> str:
             f"News / spacing block : {candidates['news_blocked']} / {candidates['spacing_blocked']}",
             f"Duplicate / budget   : {candidates['duplicate']} / {candidates['budget_blocked']}",
             f"Sent to AI           : {candidates['sent_to_ai']}",
+            "Terminal dispositions: "
+            + ", ".join(
+                f"{key}={value}" for key, value in candidates["dispositions"].items()
+            ),
+            "Latest observations   : "
+            + (
+                ", ".join(
+                    f"{key}={value}"
+                    for key, value in candidates[
+                        "latest_observation_dispositions"
+                    ].items()
+                )
+                or "none/legacy"
+            ),
+            "",
+            "ADVISORY INPUT REPLAY",
+            f"Replayable / legacy unavailable: {replay['replayable']} / {replay['legacy_unavailable']}",
+            f"Missing new / prompt-versioned: {replay['missing_new_schema']} / {replay['prompt_versioned']}",
             "",
             "AI CONVERSION",
             f"Eligible / sent      : {conversion['eligible_deterministic_candidates']} / {conversion['sent_to_gpt']}",

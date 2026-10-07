@@ -1,20 +1,34 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from xauusd_bot import cli
+from xauusd_bot.advisor import (
+    SYSTEM_INSTRUCTIONS,
+    SYSTEM_PROMPT_SHA256,
+    SYSTEM_PROMPT_VERSION,
+)
 from xauusd_bot.advisory_service import AIAdvisoryService
-from xauusd_bot.ai_models import AdvisoryResult, TokenUsage, TradeDecision
+from xauusd_bot.ai_models import (
+    ADVISORY_SCHEMA_VERSION,
+    AdvisoryResult,
+    TokenUsage,
+    TradeDecision,
+)
 from xauusd_bot.config import AIConfig, MarketGateConfig, NewsGateConfig, Settings
 from xauusd_bot.economic_calendar import EconomicCalendarGate
 from xauusd_bot.market_gate import MarketGate
-from xauusd_bot.payload import build_ai_payload
-from xauusd_bot.state_store import SQLiteStateStore
+from xauusd_bot.payload import build_ai_payload, payload_hash, serialize_ai_payload
+from xauusd_bot.state_store import AdvisoryInput, SQLiteStateStore
 from tests.test_advisor import decision
 from tests.test_market_gate import SERVER_TIME, _snapshot
 from tests.test_news_gate import event
@@ -87,6 +101,71 @@ class AdvisoryFlowTests(unittest.IsolatedAsyncioTestCase):
         ).evaluate(snapshot, market, safe_news())
         self.assertTrue(outcome.attempted)
         self.assertEqual(self.advisor.calls, 1)
+
+    async def test_exact_sanitized_input_and_tick_summary_are_persisted(self) -> None:
+        snapshot = _snapshot()
+        market = MarketGate(MarketGateConfig()).evaluate(snapshot)
+        outcome = await AIAdvisoryService(
+            self.config, state_store=self.store, advisor=self.advisor
+        ).evaluate(snapshot, market, safe_news())
+        assert outcome.reservation is not None
+        assert outcome.reservation.usage_id is not None
+        replay = SQLiteStateStore.advisory_input_read_only(
+            self.path, outcome.reservation.usage_id
+        )
+        self.assertTrue(replay["available"])
+        expected_json = serialize_ai_payload(self.advisor.payloads[0])
+        self.assertEqual(replay["sanitized_user_input_json"], expected_json)
+        self.assertEqual(
+            replay["sanitized_user_input"]["recent_tick_behavior"],
+            self.advisor.payloads[0]["recent_tick_behavior"],
+        )
+        self.assertEqual(
+            len(replay["sanitized_user_input"]["completed_m1_candles"]), 30
+        )
+        self.assertEqual(
+            len(replay["sanitized_user_input"]["completed_m5_candles"]), 20
+        )
+        self.assertEqual(replay["prompt_version"], SYSTEM_PROMPT_VERSION)
+        self.assertEqual(replay["system_prompt_sha256"], SYSTEM_PROMPT_SHA256)
+        self.assertEqual(replay["advisory_schema_version"], ADVISORY_SCHEMA_VERSION)
+        encoded = expected_json.lower()
+        for forbidden in (
+            "api_key",
+            "authorization",
+            "mcp_token",
+            "account_login",
+            "free_margin",
+            "broker",
+        ):
+            self.assertNotIn(forbidden, encoded)
+
+    def test_prompt_hash_is_deterministic_without_changing_prompt(self) -> None:
+        self.assertEqual(
+            SYSTEM_PROMPT_SHA256,
+            hashlib.sha256(SYSTEM_INSTRUCTIONS.encode("utf-8")).hexdigest(),
+        )
+
+    def test_state_store_rejects_forbidden_advisory_input(self) -> None:
+        payload_json = json.dumps(
+            {"schema_version": "1.0", "api_key": "must-not-persist"},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        with self.assertRaises(ValueError):
+            self.store.begin_ai_attempt(
+                symbol="XAUUSD",
+                completed_m1_time="2026-01-05T12:09:00",
+                input_hash=hashlib.sha256(payload_json.encode()).hexdigest(),
+                config=self.config,
+                advisory_input=AdvisoryInput(
+                    SYSTEM_PROMPT_VERSION,
+                    SYSTEM_PROMPT_SHA256,
+                    ADVISORY_SCHEMA_VERSION,
+                    payload_json,
+                ),
+            )
+        self.assertEqual(self.store.usage_summary().calls_today, 0)
 
     async def test_same_candidate_twice_makes_only_one_call(self) -> None:
         snapshot = _snapshot()
@@ -179,6 +258,72 @@ class CLISafetyTests(unittest.TestCase):
         preview.assert_awaited_once()
         normal.assert_not_awaited()
         ai.assert_not_awaited()
+
+    def test_advisory_input_cli_is_read_only_and_legacy_is_clear(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "state.sqlite3"
+            config = AIConfig(api_key="fake", state_db_path=path)
+            store = SQLiteStateStore(path)
+            payload = {"schema_version": "1.0", "market": {"symbol": "XAUUSD"}}
+            payload_json = serialize_ai_payload(payload)
+            reservation = store.begin_ai_attempt(
+                symbol="XAUUSD",
+                completed_m1_time="2026-01-05T12:09:00",
+                input_hash=payload_hash(payload),
+                config=config,
+                advisory_input=AdvisoryInput(
+                    SYSTEM_PROMPT_VERSION,
+                    SYSTEM_PROMPT_SHA256,
+                    ADVISORY_SCHEMA_VERSION,
+                    payload_json,
+                ),
+            )
+            missing = store.begin_ai_attempt(
+                symbol="XAUUSD",
+                completed_m1_time="2026-01-05T12:10:00",
+                input_hash="legacy",
+                config=config,
+            )
+            before = hashlib.sha256(path.read_bytes()).hexdigest()
+            output = StringIO()
+            with (
+                patch.object(cli, "load_dotenv"),
+                patch.object(cli.AIConfig, "from_environment", return_value=config),
+                patch.object(cli.Settings, "from_environment") as settings,
+                patch.object(cli, "_run_ai") as ai,
+                patch.object(cli, "_run") as mt5,
+                redirect_stdout(output),
+            ):
+                cli.main(["--advisory-input", str(reservation.usage_id), "--json"])
+            exported = json.loads(output.getvalue())
+            self.assertTrue(exported["available"])
+            self.assertEqual(exported["sanitized_user_input"], payload)
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), before)
+            settings.assert_not_called()
+            ai.assert_not_called()
+            mt5.assert_not_called()
+
+            assert missing.usage_id is not None
+            unavailable = SQLiteStateStore.advisory_input_read_only(
+                path, missing.usage_id
+            )
+            self.assertFalse(unavailable["available"])
+            self.assertEqual(
+                unavailable["reason"],
+                "exact advisory input missing for a post-migration record",
+            )
+
+            legacy_path = Path(temp) / "legacy.sqlite3"
+            connection = sqlite3.connect(legacy_path)
+            connection.execute("CREATE TABLE api_usage (id INTEGER PRIMARY KEY)")
+            connection.execute("INSERT INTO api_usage VALUES (7)")
+            connection.commit()
+            connection.close()
+            legacy = SQLiteStateStore.advisory_input_read_only(legacy_path, 7)
+            self.assertEqual(
+                legacy["reason"],
+                "exact advisory input unavailable for this legacy record",
+            )
 
 
 if __name__ == "__main__":

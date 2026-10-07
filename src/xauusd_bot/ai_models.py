@@ -7,6 +7,9 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 
+ADVISORY_SCHEMA_VERSION = "1.0"
+
+
 class TradeDecision(str, Enum):
     BUY = "BUY"
     SELL = "SELL"

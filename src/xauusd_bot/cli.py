@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import logging
 import sys
 from datetime import date
@@ -62,6 +63,12 @@ def _parser() -> argparse.ArgumentParser:
         "--paper-report",
         action="store_true",
         help="Analyze persisted advisory/paper data using read-only SQLite",
+    )
+    mode.add_argument(
+        "--advisory-input",
+        type=int,
+        metavar="USAGE_ID",
+        help="Export one stored sanitized advisory input using read-only SQLite",
     )
     parser.add_argument(
         "--today",
@@ -134,8 +141,6 @@ def _print_usage(config: AIConfig, json_output: bool) -> None:
         legacy_reserve_usd=config.budget_reserve_per_call_usd,
     ).usage_summary()
     if json_output:
-        import json
-
         print(json.dumps(summary.to_dict(), indent=2))
         return
     print("OpenAI advisory usage (local persisted estimate)")
@@ -167,11 +172,48 @@ def _print_paper_report(
     print(paper_report_to_json(report) if json_output else paper_report_to_human(report))
 
 
+def _print_advisory_input(
+    config: AIConfig,
+    *,
+    usage_id: int,
+    json_output: bool,
+    packaged: bool,
+) -> None:
+    path = packaged_state_path(config) if packaged else config.state_db_path.resolve()
+    value = SQLiteStateStore.advisory_input_read_only(path, usage_id)
+    if json_output:
+        print(json.dumps(value, indent=2, ensure_ascii=False, allow_nan=False))
+        return
+    if not value["available"]:
+        print(value["reason"])
+        return
+    print("Stored sanitized advisory input (read-only)")
+    print("=" * 43)
+    print(f"Usage / candidate    : {value['usage_id']} / {value['candidate_time']}")
+    print(f"Model / reasoning    : {value['model']} / {value['reasoning_effort']}")
+    print(
+        f"Prompt / schema      : {value['prompt_version']} / "
+        f"{value['advisory_schema_version']}"
+    )
+    print(f"System prompt SHA256 : {value['system_prompt_sha256']}")
+    print(f"Payload SHA256       : {value['payload_hash']}")
+    print("Sanitized user input :")
+    print(value["sanitized_user_input_json"])
+
+
 def main(argv: list[str] | None = None) -> None:
     args = _parser().parse_args(argv)
     load_dotenv()
-    if (args.today or args.date or args.packaged_state) and not args.paper_report:
-        print("Configuration error: --today, --date, and --packaged-state require --paper-report", file=sys.stderr)
+    if (args.today or args.date) and not args.paper_report:
+        print("Configuration error: --today and --date require --paper-report", file=sys.stderr)
+        raise SystemExit(2)
+    if args.packaged_state and not (
+        args.paper_report or args.advisory_input is not None
+    ):
+        print(
+            "Configuration error: --packaged-state requires --paper-report or --advisory-input",
+            file=sys.stderr,
+        )
         raise SystemExit(2)
     if args.today and args.date:
         print("Configuration error: --today and --date are mutually exclusive", file=sys.stderr)
@@ -189,6 +231,20 @@ def main(argv: list[str] | None = None) -> None:
             )
         except (ConfigurationError, PaperReportError) as exc:
             print(f"Paper report error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        return
+    if args.advisory_input is not None:
+        try:
+            ai_config = AIConfig.from_environment()
+            configure_logging("INFO", secrets=(ai_config.api_key or "",))
+            _print_advisory_input(
+                ai_config,
+                usage_id=args.advisory_input,
+                json_output=args.json,
+                packaged=args.packaged_state,
+            )
+        except ConfigurationError as exc:
+            print(f"Configuration error: {exc}", file=sys.stderr)
             raise SystemExit(2) from exc
         return
     if args.usage:

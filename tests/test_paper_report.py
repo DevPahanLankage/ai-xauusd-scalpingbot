@@ -7,7 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
-from contextlib import redirect_stdout
+from contextlib import closing, redirect_stdout
 from datetime import date, datetime, timezone
 from io import StringIO
 from pathlib import Path
@@ -271,7 +271,9 @@ class PaperReportTests(unittest.TestCase):
 
     def test_candidate_analytics_conversion_and_server_hours(self) -> None:
         store = SQLiteStateStore(self.path)
-        snapshot = _snapshot()
+        snapshot = replace(
+            _snapshot(), captured_at_utc="2026-10-06T10:00:00+00:00"
+        )
         base_gate = MarketGate(MarketGateConfig()).evaluate(snapshot)
         news = safe_news()
         rows = (
@@ -331,6 +333,69 @@ class PaperReportTests(unittest.TestCase):
         self.assertEqual(hours["11:00"]["candidates"], 2)
         self.assertEqual(hours["12:00"]["calls"], 6)
 
+    def test_quality_distinguishes_legacy_overwrite_and_new_terminal_mismatch(self) -> None:
+        store = SQLiteStateStore(self.path)
+        snapshot = replace(
+            _snapshot(), captured_at_utc="2026-10-06T10:30:00+00:00"
+        )
+        gate = MarketGate(MarketGateConfig()).evaluate(snapshot)
+        news = safe_news()
+        store.record_research_candidate(
+            snapshot,
+            gate,
+            news,
+            candidate_hash="linked",
+            disposition="NOT_ELIGIBLE",
+        )
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                """
+                UPDATE research_candidates SET
+                    advisory_usage_id=1, decision='NO_TRADE'
+                WHERE symbol='XAUUSD' AND completed_m1_time=?
+                """,
+                (gate.completed_m1_time,),
+            )
+            connection.commit()
+        report = self.report()
+        self.assertEqual(
+            report["data_quality"]["legacy_overwritten_terminal_dispositions"],
+            1,
+        )
+        self.assertEqual(report["deterministic_candidates"]["sent_to_ai"], 1)
+
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                """
+                UPDATE research_candidates SET
+                    terminal_disposition='SENT_TO_AI', disposition='NOT_ELIGIBLE'
+                WHERE symbol='XAUUSD' AND completed_m1_time=?
+                """,
+                (gate.completed_m1_time,),
+            )
+            connection.commit()
+        report = self.report()
+        self.assertEqual(
+            report["data_quality"]["terminal_disposition_mismatches"], 1
+        )
+
+    def test_false_complete_missing_checkpoint_is_explicit(self) -> None:
+        with closing(sqlite3.connect(self.path)) as connection:
+            paper_id = connection.execute(
+                """
+                SELECT id FROM paper_evaluations
+                WHERE decision='NO_TRADE' ORDER BY id LIMIT 1
+                """
+            ).fetchone()[0]
+            connection.execute(
+                "DELETE FROM paper_checkpoints WHERE paper_id=? AND checkpoint_minutes=30",
+                (paper_id,),
+            )
+            connection.commit()
+        quality = self.report()["data_quality"]
+        self.assertEqual(quality["missing_checkpoints"], 1)
+        self.assertEqual(quality["false_complete_missing_checkpoints"], 1)
+
 
 class PartialAndEmptyDatabaseTests(unittest.TestCase):
     def test_empty_database_returns_zero_report_without_mutation(self) -> None:
@@ -364,6 +429,11 @@ class PartialAndEmptyDatabaseTests(unittest.TestCase):
             report = build_paper_report(path)
             self.assertEqual(report["decisions"]["NO_TRADE"]["count"], 1)
             self.assertIn("paper_evaluations table is missing (older database)", report["data_quality"]["warnings"])
+            self.assertEqual(
+                report["data_quality"]["legacy_missing_sanitized_advisory_inputs"],
+                1,
+            )
+            self.assertEqual(report["advisory_input_replay"]["legacy_unavailable"], 1)
 
     def test_packaged_state_path_uses_local_app_data(self) -> None:
         config = AIConfig(state_db_path=Path(".state/custom.sqlite3"))

@@ -7,14 +7,18 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any
 
-from .advisor import OpenAIAdvisor
-from .ai_models import AdvisoryResult, safe_no_trade
+from .advisor import (
+    SYSTEM_PROMPT_SHA256,
+    SYSTEM_PROMPT_VERSION,
+    OpenAIAdvisor,
+)
+from .ai_models import ADVISORY_SCHEMA_VERSION, AdvisoryResult, safe_no_trade
 from .config import AIConfig, PaperConfig
 from .economic_calendar import EconomicNewsGateResult
 from .models import MarketGateResult, XAUUSDMarketSnapshot
-from .payload import build_validated_ai_payload, payload_hash
+from .payload import build_validated_ai_payload, payload_hash, serialize_ai_payload
 from .paper import PaperPerformanceTracker
-from .state_store import AttemptReservation, SQLiteStateStore
+from .state_store import AdvisoryInput, AttemptReservation, SQLiteStateStore
 from .timestamps import parse_timestamp
 
 
@@ -94,6 +98,12 @@ class AIAdvisoryService:
             config=self._config,
             automatic=automatic,
             min_interval_minutes=min_interval_minutes,
+            advisory_input=AdvisoryInput(
+                prompt_version=SYSTEM_PROMPT_VERSION,
+                system_prompt_sha256=SYSTEM_PROMPT_SHA256,
+                advisory_schema_version=ADVISORY_SCHEMA_VERSION,
+                payload_json=serialize_ai_payload(payload),
+            ),
         )
         if not reservation.reserved:
             return AIAdvisoryOutcome(

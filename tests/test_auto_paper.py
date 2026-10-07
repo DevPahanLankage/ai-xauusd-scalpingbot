@@ -271,6 +271,62 @@ class PaperTrackingTests(unittest.TestCase):
         minutes = [item["checkpoint_minutes"] for item in self.latest()["checkpoints"]]
         self.assertEqual(minutes, [1, 3, 5, 10])
 
+    def test_no_trade_does_not_complete_without_tick_at_30m_target(self) -> None:
+        self.register(advisory(TradeDecision.NO_TRADE))
+        self.paper.observe(
+            self.observed(
+                15,
+                [
+                    (1, 2010.0, 2010.2),
+                    (3, 2010.1, 2010.3),
+                    (5, 2010.2, 2010.4),
+                    (10, 2010.3, 2010.5),
+                    (15, 2010.4, 2010.6),
+                ],
+            )
+        )
+        self.paper.observe(self.observed(30, [(29.99, 2010.5, 2010.7)]))
+        row = self.latest()
+        self.assertEqual(row["status"], "OBSERVING")
+        self.assertNotIn(
+            30, [item["checkpoint_minutes"] for item in row["checkpoints"]]
+        )
+
+    def test_later_valid_30m_tick_records_checkpoint_then_completes(self) -> None:
+        self.register(advisory(TradeDecision.NO_TRADE))
+        self.paper.observe(
+            self.observed(
+                30,
+                [
+                    (1, 2010.0, 2010.2),
+                    (3, 2010.1, 2010.3),
+                    (5, 2010.2, 2010.4),
+                    (10, 2010.3, 2010.5),
+                    (15, 2010.4, 2010.6),
+                    (29.99, 2010.5, 2010.7),
+                ],
+            )
+        )
+        self.assertEqual(self.latest()["status"], "OBSERVING")
+        self.paper.observe(self.observed(30.2, [(30.1, 2010.6, 2010.8)]))
+        row = self.latest()
+        self.assertEqual(row["status"], "OBSERVATION_COMPLETE")
+        self.assertEqual(
+            [item["checkpoint_minutes"] for item in row["checkpoints"]],
+            [1, 3, 5, 10, 15, 30],
+        )
+
+    def test_no_trade_excessive_gap_remains_conservatively_incomplete(self) -> None:
+        self.register(advisory(TradeDecision.NO_TRADE))
+        strict = PaperPerformanceTracker(
+            self.store,
+            replace(self.paper.config, max_observation_gap_seconds=90.0),
+        )
+        strict.observe(self.observed(5, [(5, 2010.2, 2010.4)]))
+        row = self.latest()
+        self.assertEqual(row["status"], "OBSERVATION_INCOMPLETE")
+        self.assertEqual(row["notes"], "observation_gap_exceeded")
+
     def test_invalid_geometry_is_persisted_invalid(self) -> None:
         self.register(advisory(TradeDecision.BUY, stop_loss=2011.0, take_profit=2012.0))
         self.assertEqual(self.latest()["status"], "INVALID")

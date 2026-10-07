@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import math
 import sqlite3
 import stat
@@ -14,10 +15,24 @@ from .ai_models import AdvisoryResult
 from .config import AIConfig
 from .economic_calendar import EconomicNewsGateResult
 from .models import MarketGateResult, XAUUSDMarketSnapshot
+from .payload import serialize_ai_payload
 from .timestamps import TimestampError, canonical_timestamp, parse_timestamp, seconds_between
 
 
 LEGACY_MIGRATION_RESERVE_USD = 0.05
+TERMINAL_RESEARCH_DISPOSITIONS = frozenset(
+    {"SENT_TO_AI", "AI_ERROR", "BUDGET_BLOCKED", "RATE_SPACING_BLOCKED", "DUPLICATE"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class AdvisoryInput:
+    """Version metadata plus the exact sanitized user JSON sent to the model."""
+
+    prompt_version: str
+    system_prompt_sha256: str
+    advisory_schema_version: str
+    payload_json: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,12 +393,58 @@ class SQLiteStateStore:
                     disposition_reason TEXT,
                     advisory_usage_id INTEGER,
                     decision TEXT,
+                    first_seen_at TEXT,
+                    first_eligible_at TEXT,
+                    sent_to_ai_at TEXT,
+                    terminal_disposition TEXT,
+                    terminal_disposition_at TEXT,
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY (symbol, completed_m1_time),
                     FOREIGN KEY (advisory_usage_id) REFERENCES api_usage(id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_research_candidates_captured
                     ON research_candidates(captured_at);
+
+                CREATE TABLE IF NOT EXISTS research_candidate_observations (
+                    symbol TEXT NOT NULL,
+                    completed_m1_time TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    trade_server_time TEXT NOT NULL,
+                    bid REAL NOT NULL,
+                    ask REAL NOT NULL,
+                    spread_price REAL NOT NULL,
+                    spread_points REAL,
+                    market_gate_eligible INTEGER NOT NULL,
+                    market_rejection_reasons_json TEXT NOT NULL,
+                    news_safe INTEGER NOT NULL,
+                    news_rejection_reasons_json TEXT NOT NULL,
+                    candidate_hash TEXT,
+                    observation_disposition TEXT NOT NULL,
+                    observation_reason TEXT,
+                    PRIMARY KEY (symbol, completed_m1_time),
+                    FOREIGN KEY (symbol, completed_m1_time)
+                        REFERENCES research_candidates(symbol, completed_m1_time)
+                );
+
+                CREATE TABLE IF NOT EXISTS advisory_inputs (
+                    usage_id INTEGER PRIMARY KEY,
+                    prompt_version TEXT NOT NULL,
+                    system_prompt_sha256 TEXT NOT NULL,
+                    advisory_schema_version TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    reasoning_effort TEXT NOT NULL,
+                    candidate_time TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    payload_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (usage_id) REFERENCES api_usage(id)
+                );
+
+                CREATE TABLE IF NOT EXISTS state_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS auto_advisory_calls (
                     usage_id INTEGER PRIMARY KEY,
@@ -437,6 +498,31 @@ class SQLiteStateStore:
                     """,
                     (self._legacy_reserve_usd,),
                 )
+            research_columns = {
+                str(row[1])
+                for row in connection.execute("PRAGMA table_info(research_candidates)")
+            }
+            for name in (
+                "first_seen_at",
+                "first_eligible_at",
+                "sent_to_ai_at",
+                "terminal_disposition",
+                "terminal_disposition_at",
+            ):
+                if name not in research_columns:
+                    connection.execute(
+                        f"ALTER TABLE research_candidates ADD COLUMN {name} TEXT"
+                    )
+            legacy_max_usage_id = connection.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM api_usage"
+            ).fetchone()[0]
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO state_metadata (key, value)
+                VALUES ('advisory_input_legacy_max_usage_id', ?)
+                """,
+                (str(legacy_max_usage_id),),
+            )
             connection.commit()
 
     def begin_ai_attempt(
@@ -449,6 +535,7 @@ class SQLiteStateStore:
         now: datetime | None = None,
         automatic: bool = False,
         min_interval_minutes: float = 0.0,
+        advisory_input: AdvisoryInput | None = None,
     ) -> AttemptReservation:
         normalized_symbol = symbol.upper()
         try:
@@ -463,6 +550,19 @@ class SQLiteStateStore:
             )
         timestamp = _utc_now(now)
         today_start, week_start = _period_starts(timestamp)
+        if advisory_input is not None:
+            try:
+                parsed_payload = json.loads(advisory_input.payload_json)
+                canonical_payload = serialize_ai_payload(parsed_payload)
+            except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                raise ValueError("Advisory input is not valid sanitized JSON") from exc
+            if canonical_payload != advisory_input.payload_json:
+                raise ValueError("Advisory input JSON is not in canonical outbound form")
+            stored_hash = hashlib.sha256(
+                advisory_input.payload_json.encode("utf-8")
+            ).hexdigest()
+            if stored_hash != input_hash:
+                raise ValueError("Advisory input hash does not match the reservation hash")
 
         with closing(self._connect()) as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -578,6 +678,28 @@ class SQLiteStateStore:
                     ),
                 )
                 usage_id = int(cursor.lastrowid)
+                if advisory_input is not None:
+                    connection.execute(
+                        """
+                        INSERT INTO advisory_inputs (
+                            usage_id, prompt_version, system_prompt_sha256,
+                            advisory_schema_version, model, reasoning_effort,
+                            candidate_time, payload_json, payload_hash, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            usage_id,
+                            advisory_input.prompt_version,
+                            advisory_input.system_prompt_sha256,
+                            advisory_input.advisory_schema_version,
+                            config.model,
+                            config.reasoning_effort,
+                            candle_time,
+                            advisory_input.payload_json,
+                            input_hash,
+                            reserved_at,
+                        ),
+                    )
                 if automatic:
                     connection.execute(
                         """
@@ -664,6 +786,10 @@ class SQLiteStateStore:
             json.dumps(news_gate.nearest_event.to_dict(), allow_nan=False, separators=(",", ":"))
             if news_gate.nearest_event else None
         )
+        now = datetime.now(timezone.utc).isoformat()
+        terminal = disposition if disposition in TERMINAL_RESEARCH_DISPOSITIONS else None
+        first_eligible = now if market_gate.eligible_for_ai and news_gate.safe_for_ai else None
+        sent_at = now if disposition in {"SENT_TO_AI", "AI_ERROR"} else None
         values = (
             symbol, candle_time, snapshot.captured_at_utc, snapshot.trade_server_time,
             snapshot.symbol.bid, snapshot.symbol.ask, snapshot.metrics.spread_price,
@@ -677,7 +803,7 @@ class SQLiteStateStore:
             int(news_gate.safe_for_ai),
             json.dumps(news_gate.rejection_reasons, separators=(",", ":")),
             nearest, candidate_hash, disposition, reason,
-            datetime.now(timezone.utc).isoformat(),
+            now, first_eligible, sent_at, terminal, now if terminal else None, now,
         )
         with closing(self._connect()) as connection:
             cursor = connection.execute(
@@ -690,12 +816,76 @@ class SQLiteStateStore:
                     m5_spike_ratio, spread_to_m1_range_ratio, market_gate_eligible,
                     market_rejection_reasons_json, news_safe,
                     news_rejection_reasons_json, nearest_event_json, candidate_hash,
-                    disposition, disposition_reason, updated_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    disposition, disposition_reason, first_seen_at, first_eligible_at,
+                    sent_to_ai_at, terminal_disposition, terminal_disposition_at,
+                    updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 values,
             )
             return cursor.rowcount == 1
+
+    def record_research_observation(
+        self,
+        snapshot: XAUUSDMarketSnapshot,
+        market_gate: MarketGateResult,
+        news_gate: EconomicNewsGateResult,
+        *,
+        candidate_hash: str | None,
+        disposition: str,
+        reason: str | None = None,
+    ) -> None:
+        """Upsert the latest same-candle observation outside immutable lifecycle state."""
+
+        if not market_gate.completed_m1_time:
+            return
+        metrics = market_gate.metrics
+        values = (
+            snapshot.symbol.symbol.upper(),
+            canonical_timestamp(market_gate.completed_m1_time),
+            datetime.now(timezone.utc).isoformat(),
+            snapshot.captured_at_utc,
+            snapshot.trade_server_time,
+            snapshot.symbol.bid,
+            snapshot.symbol.ask,
+            snapshot.metrics.spread_price,
+            metrics.spread_points,
+            int(market_gate.eligible_for_ai),
+            json.dumps(market_gate.rejection_reasons, separators=(",", ":")),
+            int(news_gate.safe_for_ai),
+            json.dumps(news_gate.rejection_reasons, separators=(",", ":")),
+            candidate_hash,
+            disposition,
+            reason,
+        )
+        with closing(self._connect()) as connection:
+            connection.execute(
+                """
+                INSERT INTO research_candidate_observations (
+                    symbol, completed_m1_time, observed_at, captured_at,
+                    trade_server_time, bid, ask, spread_price, spread_points,
+                    market_gate_eligible, market_rejection_reasons_json,
+                    news_safe, news_rejection_reasons_json, candidate_hash,
+                    observation_disposition, observation_reason
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(symbol, completed_m1_time) DO UPDATE SET
+                    observed_at=excluded.observed_at,
+                    captured_at=excluded.captured_at,
+                    trade_server_time=excluded.trade_server_time,
+                    bid=excluded.bid,
+                    ask=excluded.ask,
+                    spread_price=excluded.spread_price,
+                    spread_points=excluded.spread_points,
+                    market_gate_eligible=excluded.market_gate_eligible,
+                    market_rejection_reasons_json=excluded.market_rejection_reasons_json,
+                    news_safe=excluded.news_safe,
+                    news_rejection_reasons_json=excluded.news_rejection_reasons_json,
+                    candidate_hash=COALESCE(excluded.candidate_hash, candidate_hash),
+                    observation_disposition=excluded.observation_disposition,
+                    observation_reason=excluded.observation_reason
+                """,
+                values,
+            )
 
     def update_research_candidate(
         self,
@@ -716,7 +906,51 @@ class SQLiteStateStore:
             json.dumps(news_gate.nearest_event.to_dict(), allow_nan=False, separators=(",", ":"))
             if news_gate.nearest_event else None
         )
+        now = datetime.now(timezone.utc).isoformat()
+        terminal = disposition if disposition in TERMINAL_RESEARCH_DISPOSITIONS else None
+        terminal_at = now if terminal else None
         with closing(self._connect()) as connection:
+            sent_at = None
+            if disposition in {"SENT_TO_AI", "AI_ERROR"}:
+                if advisory_usage_id is not None:
+                    called = connection.execute(
+                        "SELECT called_at FROM auto_advisory_calls WHERE usage_id=?",
+                        (advisory_usage_id,),
+                    ).fetchone()
+                    sent_at = str(called["called_at"]) if called and called["called_at"] else now
+                else:
+                    sent_at = now
+            existing = connection.execute(
+                """
+                SELECT terminal_disposition FROM research_candidates
+                WHERE symbol=? AND completed_m1_time=?
+                """,
+                (
+                    snapshot.symbol.symbol.upper(),
+                    canonical_timestamp(market_gate.completed_m1_time),
+                ),
+            ).fetchone()
+            if existing is not None and existing["terminal_disposition"] is not None:
+                # Permit only one-time linkage enrichment for the same terminal
+                # event; no quote, gate, timestamp, or disposition field changes.
+                if str(existing["terminal_disposition"]) == disposition:
+                    connection.execute(
+                        """
+                        UPDATE research_candidates SET
+                            advisory_usage_id=COALESCE(advisory_usage_id, ?),
+                            decision=COALESCE(decision, ?),
+                            sent_to_ai_at=COALESCE(sent_to_ai_at, ?)
+                        WHERE symbol=? AND completed_m1_time=?
+                        """,
+                        (
+                            advisory_usage_id,
+                            decision,
+                            sent_at,
+                            snapshot.symbol.symbol.upper(),
+                            canonical_timestamp(market_gate.completed_m1_time),
+                        ),
+                    )
+                return
             connection.execute(
                 """
                 UPDATE research_candidates SET
@@ -728,9 +962,17 @@ class SQLiteStateStore:
                     market_gate_eligible=?, market_rejection_reasons_json=?,
                     news_safe=?, news_rejection_reasons_json=?, nearest_event_json=?,
                     candidate_hash=COALESCE(?, candidate_hash), disposition=?,
-                    disposition_reason=?, advisory_usage_id=COALESCE(?, advisory_usage_id),
-                    decision=COALESCE(?, decision), updated_at=?
+                    disposition_reason=?,
+                    advisory_usage_id=COALESCE(advisory_usage_id, ?),
+                    decision=COALESCE(decision, ?),
+                    first_eligible_at=COALESCE(first_eligible_at, ?),
+                    sent_to_ai_at=COALESCE(sent_to_ai_at, ?),
+                    terminal_disposition=COALESCE(terminal_disposition, ?),
+                    terminal_disposition_at=COALESCE(terminal_disposition_at, ?),
+                    updated_at=?
                 WHERE symbol=? AND completed_m1_time=?
+                  AND terminal_disposition IS NULL
+                  AND advisory_usage_id IS NULL
                 """,
                 (
                     snapshot.captured_at_utc, snapshot.trade_server_time,
@@ -745,7 +987,9 @@ class SQLiteStateStore:
                     int(news_gate.safe_for_ai),
                     json.dumps(news_gate.rejection_reasons, separators=(",", ":")),
                     nearest, candidate_hash, disposition, reason, advisory_usage_id,
-                    decision, datetime.now(timezone.utc).isoformat(),
+                    decision,
+                    now if market_gate.eligible_for_ai and news_gate.safe_for_ai else None,
+                    sent_at, terminal, terminal_at, now,
                     snapshot.symbol.symbol.upper(),
                     canonical_timestamp(market_gate.completed_m1_time),
                 ),
@@ -758,6 +1002,107 @@ class SQLiteStateStore:
                 (symbol.upper(), canonical_timestamp(completed_m1_time)),
             ).fetchone()
             return dict(row) if row is not None else None
+
+    def research_candidate_observation(
+        self, symbol: str, completed_m1_time: str
+    ) -> dict[str, Any] | None:
+        with closing(self._connect()) as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM research_candidate_observations
+                WHERE symbol=? AND completed_m1_time=?
+                """,
+                (symbol.upper(), canonical_timestamp(completed_m1_time)),
+            ).fetchone()
+            return dict(row) if row is not None else None
+
+    @classmethod
+    def advisory_input_read_only(cls, path: Path, usage_id: int) -> dict[str, Any]:
+        """Read a replayable advisory input without initializing or mutating SQLite."""
+
+        unavailable = {
+            "available": False,
+            "usage_id": usage_id,
+        }
+        if usage_id <= 0:
+            return {**unavailable, "reason": "advisory usage id must be positive"}
+        resolved = path.resolve()
+        if not resolved.is_file():
+            return {**unavailable, "reason": "state database not found"}
+        with closing(cls._connect_read_only(resolved)) as connection:
+            connection.execute("PRAGMA query_only = ON")
+            tables = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+            if "api_usage" not in tables:
+                return {**unavailable, "reason": "advisory usage record not found"}
+            usage = connection.execute(
+                "SELECT id FROM api_usage WHERE id=?", (usage_id,)
+            ).fetchone()
+            if usage is None:
+                return {**unavailable, "reason": "advisory usage record not found"}
+            if "advisory_inputs" not in tables:
+                return {
+                    **unavailable,
+                    "reason": "exact advisory input unavailable for this legacy record",
+                }
+            row = connection.execute(
+                "SELECT * FROM advisory_inputs WHERE usage_id=?", (usage_id,)
+            ).fetchone()
+            legacy_max_id = 0
+            if "state_metadata" in tables:
+                boundary = connection.execute(
+                    """
+                    SELECT value FROM state_metadata
+                    WHERE key='advisory_input_legacy_max_usage_id'
+                    """
+                ).fetchone()
+                if boundary is not None:
+                    try:
+                        legacy_max_id = int(boundary["value"])
+                    except (TypeError, ValueError):
+                        legacy_max_id = 0
+        if row is None:
+            return {
+                **unavailable,
+                "reason": (
+                    "exact advisory input unavailable for this legacy record"
+                    if usage_id <= legacy_max_id
+                    else "exact advisory input missing for a post-migration record"
+                ),
+            }
+        values = dict(row)
+        try:
+            payload = json.loads(str(values["payload_json"]))
+            canonical = serialize_ai_payload(payload)
+            digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {
+                **unavailable,
+                "reason": "stored advisory input failed safety validation",
+            }
+        if canonical != values["payload_json"] or digest != values["payload_hash"]:
+            return {
+                **unavailable,
+                "reason": "stored advisory input failed integrity validation",
+            }
+        return {
+            "available": True,
+            "usage_id": usage_id,
+            "prompt_version": values["prompt_version"],
+            "system_prompt_sha256": values["system_prompt_sha256"],
+            "advisory_schema_version": values["advisory_schema_version"],
+            "model": values["model"],
+            "reasoning_effort": values["reasoning_effort"],
+            "candidate_time": values["candidate_time"],
+            "payload_hash": values["payload_hash"],
+            "created_at": values["created_at"],
+            "sanitized_user_input": payload,
+            "sanitized_user_input_json": canonical,
+        }
 
     def finish_ai_attempt(
         self,
@@ -900,6 +1245,16 @@ class SQLiteStateStore:
                 f"INSERT OR IGNORE INTO paper_checkpoints ({','.join(columns)}) "
                 f"VALUES ({','.join('?' for _ in columns)})",
                 tuple(values.get(column) for column in columns),
+            )
+
+    def paper_checkpoint_minutes(self, paper_id: int) -> frozenset[int]:
+        with closing(self._connect()) as connection:
+            return frozenset(
+                int(row[0])
+                for row in connection.execute(
+                    "SELECT checkpoint_minutes FROM paper_checkpoints WHERE paper_id=?",
+                    (paper_id,),
+                )
             )
 
     def paper_dashboard(self, history_limit: int = 20) -> dict[str, Any]:

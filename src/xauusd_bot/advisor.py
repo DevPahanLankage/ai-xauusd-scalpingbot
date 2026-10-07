@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import hashlib
 import math
 import time
 from typing import Any
@@ -13,6 +13,7 @@ from .ai_models import (
     safe_no_trade,
 )
 from .config import AIConfig
+from .payload import serialize_ai_payload
 
 
 SYSTEM_INSTRUCTIONS = """You are a conservative XAUUSD scalping analyst.
@@ -24,6 +25,11 @@ future certainty. Consider spread, recent volatility, short-term structure, M1/M
 context, tick behavior, and the supplied news context. Keep rationale fields concise.
 For BUY, place stop loss below entry and take profit above entry. For SELL, place stop
 loss above entry and take profit below entry. Use null price fields for NO_TRADE."""
+
+# The prompt text is intentionally unchanged. These identifiers make its use
+# attributable without storing another copy beside every advisory input.
+SYSTEM_PROMPT_VERSION = "1.0"
+SYSTEM_PROMPT_SHA256 = hashlib.sha256(SYSTEM_INSTRUCTIONS.encode("utf-8")).hexdigest()
 
 
 def estimate_cost(usage: TokenUsage, config: AIConfig) -> float:
@@ -198,12 +204,7 @@ class OpenAIAdvisor:
                     {"role": "system", "content": SYSTEM_INSTRUCTIONS},
                     {
                         "role": "user",
-                        "content": json.dumps(
-                            payload,
-                            allow_nan=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ),
+                        "content": serialize_ai_payload(payload),
                     },
                 ],
                 text_format=AITradeDecision,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -184,11 +185,78 @@ class StateStoreTests(unittest.TestCase):
         self.assertEqual(summary.budget_accounted_spend_today_usd, 0.0742)
         migrated = sqlite3.connect(self.path)
         columns = {row[1] for row in migrated.execute("PRAGMA table_info(api_usage)")}
+        research_columns = {
+            row[1]
+            for row in migrated.execute("PRAGMA table_info(research_candidates)")
+        }
+        tables = {
+            row[0]
+            for row in migrated.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        legacy_boundary = migrated.execute(
+            """
+            SELECT value FROM state_metadata
+            WHERE key='advisory_input_legacy_max_usage_id'
+            """
+        ).fetchone()[0]
         migrated.close()
         self.assertTrue(
             {"cache_write_tokens", "budget_reserved_usd", "budget_accounted_usd"}
             <= columns
         )
+        self.assertTrue(
+            {
+                "first_seen_at",
+                "first_eligible_at",
+                "sent_to_ai_at",
+                "terminal_disposition",
+                "terminal_disposition_at",
+            }
+            <= research_columns
+        )
+        self.assertTrue(
+            {"advisory_inputs", "research_candidate_observations", "state_metadata"}
+            <= tables
+        )
+        self.assertEqual(legacy_boundary, "2")
+        replay = SQLiteStateStore.advisory_input_read_only(self.path, 1)
+        self.assertEqual(
+            replay["reason"],
+            "exact advisory input unavailable for this legacy record",
+        )
+
+    def test_migration_does_not_backfill_historical_candidate_facts(self) -> None:
+        store = SQLiteStateStore(self.path)
+        with closing(sqlite3.connect(self.path)) as connection:
+            connection.execute(
+                """
+                INSERT INTO research_candidates (
+                    symbol, completed_m1_time, captured_at, trade_server_time,
+                    bid, ask, spread_price, direction_m1, direction_m5,
+                    directions_aligned, market_gate_eligible,
+                    market_rejection_reasons_json, news_safe,
+                    news_rejection_reasons_json, disposition, updated_at
+                ) VALUES (
+                    'XAUUSD', '2026-01-07T11:59:00', ?,
+                    '2026-01-07T12:00:00', 2000.0, 2000.2, 0.2,
+                    'DOWN', 'DOWN', 1, 0, '["legacy_overwrite"]', 1,
+                    '[]', 'NOT_ELIGIBLE', ?
+                )
+                """,
+                (NOW.isoformat(), NOW.isoformat()),
+            )
+            connection.commit()
+        SQLiteStateStore(self.path)
+        row = store.research_candidate("XAUUSD", "2026-01-07T11:59:00")
+        assert row is not None
+        self.assertEqual(row["disposition"], "NOT_ELIGIBLE")
+        self.assertIsNone(row["first_seen_at"])
+        self.assertIsNone(row["first_eligible_at"])
+        self.assertIsNone(row["sent_to_ai_at"])
+        self.assertIsNone(row["terminal_disposition"])
+        self.assertIsNone(row["terminal_disposition_at"])
 
 
 if __name__ == "__main__":

@@ -149,10 +149,17 @@ def build_ai_payload(
 
 
 def payload_hash(payload: dict[str, Any]) -> str:
-    encoded = json.dumps(
-        payload, allow_nan=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+    encoded = serialize_ai_payload(payload).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def serialize_ai_payload(payload: dict[str, Any]) -> str:
+    """Return the exact canonical JSON used as the advisory user input."""
+
+    _validate_tree(payload)
+    return json.dumps(
+        payload, allow_nan=False, sort_keys=True, separators=(",", ":")
+    )
 
 
 def _validate_tree(value: Any, path: str = "payload") -> None:

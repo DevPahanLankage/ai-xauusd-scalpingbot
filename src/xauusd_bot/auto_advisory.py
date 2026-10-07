@@ -91,8 +91,20 @@ class AutomaticAdvisoryCoordinator:
             snapshot, gate, news, candidate_hash=candidate_hash,
             disposition=disposition, reason=reason,
         )
+        self.state_store.record_research_observation(
+            snapshot,
+            gate,
+            news,
+            candidate_hash=candidate_hash,
+            disposition=disposition,
+            reason=reason,
+        )
         row = self.state_store.research_candidate(snapshot.symbol.symbol, gate.completed_m1_time)
         if not created and row is not None:
+            # A terminal candidate row is historical fact. Later quote refreshes are
+            # retained in research_candidate_observations, never in this lifecycle row.
+            if row.get("terminal_disposition") or row.get("advisory_usage_id") is not None:
+                return row
             changed = (
                 row.get("disposition") != disposition
                 or bool(row.get("market_gate_eligible")) != gate.eligible_for_ai

@@ -92,6 +92,85 @@ class ResearchCandidatePersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["disposition"], "AUTO_DISABLED")
         self.assertTrue(bool(row["market_gate_eligible"]))
 
+    async def test_sent_candidate_is_immutable_while_latest_observation_changes(self) -> None:
+        self.store.record_research_candidate(
+            self.snapshot,
+            self.gate,
+            self.news,
+            candidate_hash="sent-hash",
+            disposition="STATE_BLOCKED",
+            reason="advisory_pending",
+        )
+        reservation = self.store.begin_ai_attempt(
+            symbol="XAUUSD",
+            completed_m1_time=self.gate.completed_m1_time or "",
+            input_hash="sent-hash",
+            config=AIConfig(api_key="fake", state_db_path=self.path),
+            automatic=True,
+        )
+        assert reservation.usage_id is not None
+        self.store.update_research_candidate(
+            self.snapshot,
+            self.gate,
+            self.news,
+            candidate_hash="sent-hash",
+            disposition="SENT_TO_AI",
+            advisory_usage_id=reservation.usage_id,
+            decision="NO_TRADE",
+        )
+        before = self.store.research_candidate(
+            "XAUUSD", self.gate.completed_m1_time or ""
+        )
+        assert before is not None
+
+        rejected = replace(
+            self.gate,
+            eligible_for_ai=False,
+            rejection_reasons=("spread_too_large_relative_to_m1_volatility",),
+        )
+        later = replace(
+            self.snapshot,
+            captured_at_utc="2026-01-05T09:11:30+00:00",
+            symbol=replace(
+                self.snapshot.symbol,
+                bid=self.snapshot.symbol.bid + 0.1,
+                ask=self.snapshot.symbol.ask + 0.1,
+            ),
+        )
+        for _ in range(2):
+            coordinator = AutomaticAdvisoryCoordinator(
+                AutoAdvisoryConfig(True),
+                _NeverService(),
+                state_store=SQLiteStateStore(self.path),  # type: ignore[arg-type]
+            )
+            await coordinator.maybe_evaluate(later, rejected, self.news)
+
+        after = self.store.research_candidate(
+            "XAUUSD", self.gate.completed_m1_time or ""
+        )
+        observation = self.store.research_candidate_observation(
+            "XAUUSD", self.gate.completed_m1_time or ""
+        )
+        assert after is not None and observation is not None
+        self.assertEqual(self.count(), 1)
+        self.assertEqual(after["disposition"], "SENT_TO_AI")
+        self.assertEqual(after["terminal_disposition"], "SENT_TO_AI")
+        self.assertEqual(after["advisory_usage_id"], reservation.usage_id)
+        self.assertEqual(after["decision"], "NO_TRADE")
+        self.assertIsNotNone(after["first_seen_at"])
+        self.assertIsNotNone(after["first_eligible_at"])
+        self.assertEqual(after["first_seen_at"], before["first_seen_at"])
+        self.assertEqual(after["first_eligible_at"], before["first_eligible_at"])
+        self.assertEqual(after["terminal_disposition_at"], before["terminal_disposition_at"])
+        self.assertEqual(after["sent_to_ai_at"], before["sent_to_ai_at"])
+        self.assertEqual(observation["observation_disposition"], "NOT_ELIGIBLE")
+        self.assertFalse(bool(observation["market_gate_eligible"]))
+        with closing(sqlite3.connect(self.path)) as connection:
+            observation_count = connection.execute(
+                "SELECT COUNT(*) FROM research_candidate_observations"
+            ).fetchone()[0]
+        self.assertEqual(observation_count, 1)
+
     async def test_research_row_contains_no_account_identity(self) -> None:
         coordinator = AutomaticAdvisoryCoordinator(
             AutoAdvisoryConfig(False), _NeverService(), state_store=self.store  # type: ignore[arg-type]
